@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login</title>
+</head>
+<body>
+
+<h1>Login</h1>
+
+<form id="loginForm" method="post" action="/login">
+    <p>
+        Username:<br>
+        <input type="text" name="username" required>
+    </p>
+    <p>
+        Password:<br>
+        <input type="password" name="password" required>
+    </p>
+    <p>
+        <button type="submit">Log In</button>
+    </p>
+</form>
+
+<!-- This div is where the login success/error message will appear -->
+<div id="responseMessage"></div>
+
+<br>
+<br>
+
+<h2>Server Status</h2>
+<p>
+    <button id="batteryButton" type="button">Check Phone Battery Status</button>
+</p>
+<!-- This div is where the battery status will be displayed -->
+<div id="batteryResponseMessage"></div>
+
+
+<script>
+    document.getElementById('loginForm').addEventListener('submit', function(event) {
+        event.preventDefault();
+
+        const formData = new FormData(this);
+        const messageDiv = document.getElementById('responseMessage');
+
+        fetch('/login', {
+            method: 'POST',
+            body: new URLSearchParams(formData)
+        })
+        .then(response => response.text())
+        .then(text => {
+            messageDiv.textContent = text;
+        })
+        .catch(err => {
+            messageDiv.textContent = 'A network error occurred.';
+        });
+    });
+
+    document.getElementById('batteryButton').addEventListener('click', function() {
+        const batteryMessageDiv = document.getElementById('batteryResponseMessage');
+        batteryMessageDiv.textContent = 'Checking...'; // Give user feedback
+
+        // Fetch data from our new /battery endpoint
+        fetch('/battery')
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Server responded with an error.');
+                }
+                return response.json(); // Parse the response as JSON
+            })
+            .then(data => {
+                // Display the formatted data
+                batteryMessageDiv.textContent = `Battery Level: ${data.level}%, Status: ${data.status}`;
+            })
+            .catch(err => {
+                console.error("Battery fetch error:", err);
+                batteryMessageDiv.textContent = 'Failed to get battery status.';
+            });
+    });
+</script>
+
+</body>
+</html>

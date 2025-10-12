@@ -1,46 +1,55 @@
 package com.example.android_helloworld
 
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.tooling.preview.Preview
-import com.example.android_helloworld.ui.theme.Android_helloworldTheme
+import com.example.android_helloworld.db.AppDatabase
+import com.example.android_helloworld.db.User
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.io.IOException
-import android.util.Log
 
 class MainActivity : ComponentActivity() {
 
-    // reference to our server
-    private var server: helloServer? = null
+    private var server: testServer? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
 
-        // Start the server here
-        server = helloServer(8080)
-        try {
-            server?.start()
-            Log.i("MainActivity", "Server started on port 8080")
-        } catch (e: IOException) {
-            e.printStackTrace()
+        // --- Setup Database and Server ---
+        // Get reference to database DAO
+        val userDao = AppDatabase.getDatabase(this).userDao()
+
+        // Insert sample user for testing
+        CoroutineScope(Dispatchers.IO).launch {
+            // Check if duplicate exists
+            if (userDao.findByUsername("testuser") == null) {
+                // Passwords are not hashed yet
+                userDao.insert(User(username = "testuser", passwordHash = "password123"))
+                Log.i("MainActivity", "Sample user 'testuser' inserted into database.")
+            }
         }
 
+        // start server
+        try {
+            server = testServer(applicationContext, userDao, 8080)
+            server?.start()
+            Log.i("MainActivity", "Server started on port 8080. Open a browser on the same WiFi network to access it.")
+        } catch (e: IOException) {
+            Log.e("MainActivity", "Server failed to start.", e)
+        }
+
+        // UI display
         setContent {
-            Android_helloworldTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    Greeting(
-                        name = "Android",
-                        modifier = Modifier.padding(innerPadding)
-                    )
-                }
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(text = "Web server is running on port 8080")
             }
         }
     }
@@ -48,22 +57,6 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         server?.stop()
-        Log.i("MainActivity", "Server stopped")
-    }
-}
-
-@Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(
-        text = "Hello $name!",
-        modifier = modifier
-    )
-}
-
-@Preview(showBackground = true)
-@Composable
-fun GreetingPreview() {
-    Android_helloworldTheme {
-        Greeting("Android")
+        Log.i("MainActivity", "Server stopped.")
     }
 }
