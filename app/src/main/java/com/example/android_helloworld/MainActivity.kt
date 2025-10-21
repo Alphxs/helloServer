@@ -4,59 +4,90 @@ import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.Text
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
+import androidx.activity.viewModels
+import androidx.room.Room
 import com.example.android_helloworld.db.AppDatabase
 import com.example.android_helloworld.db.User
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import java.io.File
 import java.io.IOException
 
 class MainActivity : ComponentActivity() {
 
     private var server: testServer? = null
 
+    // Lazily initialize the database instance.
+    private val db by lazy {
+        Room.databaseBuilder(
+            applicationContext,
+            AppDatabase::class.java,
+            "hello-server-db"
+        )
+            // This will delete and recreate the database on schema changes.
+            // It's simple for development but not for production apps with real user data.
+            .fallbackToDestructiveMigration()
+            .build()
+    }
+
+    // Initialize the ViewModel using the factory that provides the Dao.
+    private val viewModel: RecognitionViewModel by viewModels {
+        RecognitionViewModelFactory(db.userDao())
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // --- Setup Database and Server ---
-        // Get reference to database DAO
-        val userDao = AppDatabase.getDatabase(this).userDao()
+        // Start the server in a background coroutine.
+        startServer()
 
-        // Insert sample user for testing
-        CoroutineScope(Dispatchers.IO).launch {
-            // Check if duplicate exists
-            if (userDao.findByUsername("testuser") == null) {
-                // Passwords are not hashed yet
-                userDao.insert(User(username = "testuser", passwordHash = "password123"))
-                Log.i("MainActivity", "Sample user 'testuser' inserted into database.")
-            }
-        }
-
-        // start server
-        try {
-            server = testServer(applicationContext, userDao, 8080)
-            server?.start()
-            Log.i("MainActivity", "Server started on port 8080. Open a browser on the same WiFi network to access it.")
-        } catch (e: IOException) {
-            Log.e("MainActivity", "Server failed to start.", e)
-        }
-
-        // UI display
+        // Set the content of the activity to be our new history screen.
         setContent {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(text = "Web server is running on port 8080")
+            // The RecognitionHistoryScreen composable will now be the main UI.
+            // It observes the ViewModel for data changes.
+            RecognitionHistoryScreen(viewModel = viewModel)
+        }
+    }
+
+    private fun startServer() {
+        // Use a dedicated CoroutineScope for the server's lifecycle.
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // Ensure the directory for storing uploaded images exists.
+                val imageDir = File(filesDir, "images")
+                if (!imageDir.exists()) {
+                    imageDir.mkdirs()
+                }
+
+                // Get a reference to the DAO.
+                val userDao = db.userDao()
+
+                // Insert the sample user for testing if it doesn't already exist.
+                if (userDao.findByUsername("testuser") == null) {
+                    userDao.insert(User(username = "testuser", passwordHash = "password123"))
+                    Log.i("MainActivity", "Sample user 'testuser' inserted into database.")
+                }
+
+                // Initialize and start the NanoHTTPD server.
+                server = testServer(applicationContext, userDao, 8080)
+                server?.start()
+                Log.i("MainActivity", "Server started successfully on port 8080.")
+
+            } catch (e: IOException) {
+                Log.e("MainActivity", "Server failed to start.", e)
+            } catch (e: Exception) {
+                Log.e("MainActivity", "An unexpected error occurred during server startup.", e)
             }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        server?.stop()
-        Log.i("MainActivity", "Server stopped.")
+        // Stop the server when the activity is destroyed to free up the port.
+        CoroutineScope(Dispatchers.IO).launch {
+            server?.stop()
+            Log.i("MainActivity", "Server stopped.")
+        }
     }
 }

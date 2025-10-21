@@ -1,140 +1,318 @@
-package com.example.android_helloworld;
+package com.example.android_helloworld
 
-import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.os.BatteryManager;
-import android.util.Log;
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.BitmapFactory
+import android.os.BatteryManager
+import android.util.Base64
+import android.util.Log
+import com.example.android_helloworld.db.UserDao
+import com.google.gson.Gson
+import com.google.mlkit.vision.digitalink.common.RecognitionResult
+import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import org.tensorflow.lite.support.image.TensorImage
+import org.tensorflow.lite.task.vision.detector.Detection
+import org.tensorflow.lite.task.vision.detector.ObjectDetector
+import java.io.File
+import java.io.IOException
+import java.security.SecureRandom
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.io.path.exists
 
-import com.example.android_helloworld.db.User;
-import com.example.android_helloworld.db.UserDao;
-import com.google.gson.Gson;
+// Data class for sending predictions back as JSON
+data class Prediction(val label: String, val score: Float)
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.util.List;
-import java.util.Map;
+class testServer(
+    private val context: Context,
+    private val userDao: UserDao,
+    port: Int
+) : NanoHTTPD(port) {
 
-import fi.iki.elonen.NanoHTTPD;
-import fi.iki.elonen.NanoHTTPD.Response.Status;
+    private val activeTokens = ConcurrentHashMap.newKeySet<String>()
+    private val gson = Gson()
 
-public class testServer extends NanoHTTPD {
+    companion object {
+        @Volatile
+        private var objectDetector: ObjectDetector? = null
 
-    private final Context context;
-    private final UserDao userDao;
-
-    public testServer(Context context, UserDao userDao, int port) throws IOException {
-        super(port);
-        this.context = context;
-        this.userDao = userDao;
+        // Singleton pattern to ensure the expensive model is loaded only once.
+        fun getDetector(applicationContext: Context): ObjectDetector {
+            return objectDetector ?: synchronized(this) {
+                objectDetector ?: run {
+                    Log.i("TestServer", "Initializing ObjectDetector singleton...")
+                    val options = ObjectDetector.ObjectDetectorOptions.builder()
+                        .setMaxResults(5)
+                        .setScoreThreshold(0.5f)
+                        .build()
+                    ObjectDetector.createFromFileAndOptions(
+                        applicationContext,
+                        "model_detection.tflite", // Ensure this model is in app/src/main/assets
+                        options
+                    ).also {
+                        objectDetector = it
+                        Log.i("TestServer", "ObjectDetector initialized successfully.")
+                    }
+                }
+            }
+        }
     }
 
-    @Override
-    public Response serve(IHTTPSession session) {
-        String uri = session.getUri();
-        Method method = session.getMethod();
-        Log.i("TestServer", "Received request: " + method + " " + uri);
-
-        // Route to serve the main HTML page
-        if (Method.GET.equals(method) && uri.equals("/")) {
+    /**
+     * The main entry point for all HTTP requests.
+     */
+    override fun serve(session: IHTTPSession): Response {
+        // Use runBlocking on a background thread to safely wait for our suspend functions.
+        return runBlocking(Dispatchers.IO) {
             try {
-                InputStream htmlStream = context.getAssets().open("login.html");
-                return newChunkedResponse(Status.OK, "text/html", htmlStream);
-            } catch (IOException e) {
-                Log.e("TestServer", "Could not load login.html", e);
-                return newFixedLengthResponse(Status.INTERNAL_ERROR, "text/plain", "Error: Could not load page.");
+                // Handle CORS preflight OPTIONS requests first.
+                if (session.method == Method.OPTIONS) {
+                    addCorsHeaders(newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, null))
+                } else {
+                    handleRequest(session)
+                }
+            } catch (e: Exception) {
+                Log.e("TestServer", "Unhandled error in serve: ${session.uri}", e)
+                addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Server Error: ${e.message}"))
             }
-        }
-
-        // Route to handle the login form submission
-        if (Method.POST.equals(method) && uri.equals("/login")) {
-            return handleLogin(session);
-        }
-
-        // Route to get the phone's battery status
-        if (Method.GET.equals(method) && uri.equals("/battery")) {
-            return handleBatteryRequest();
-        }
-
-        // If no other routes matched, return a 404 Not Found error
-        return newFixedLengthResponse(Status.NOT_FOUND, "text/plain", "Not Found");
-    }
-
-    /**
-     * Handles the logic for a POST request to /login.
-     */
-    private Response handleLogin(IHTTPSession session) {
-        try {
-            // This map will hold the form data (e.g., username and password)
-            session.parseBody(null);
-            Map<String, String> params = session.getParms();
-
-            String username = params.get("username");
-            String password = params.get("password");
-
-            // Basic validation
-            if (username == null || password == null || username.isEmpty() || password.isEmpty()) {
-                return newFixedLengthResponse(Status.BAD_REQUEST, "text/plain", "Username and password are required.");
-            }
-
-            // --- Database Interaction ---
-            User user = userDao.findByUsername(username);
-
-            if (user == null) {
-                Log.w("HelloServer", "Login FAILED for user: " + username + " (user not found)");
-                return newFixedLengthResponse(Status.UNAUTHORIZED, "text/plain", "Invalid username or password.");
-            }
-
-            if (password.equals(user.getPasswordHash())) {
-                Log.i("HelloServer", "Login SUCCESS for user: " + username);
-                return newFixedLengthResponse(Status.OK, "text/plain", "Login successful!");
-            } else {
-                Log.w("HelloServer", "Login FAILED for user: " + username + " (incorrect password)");
-                return newFixedLengthResponse(Status.UNAUTHORIZED, "text/plain", "Invalid username or password.");
-            }
-
-        } catch (IOException | ResponseException e) {
-            Log.e("HelloServer", "Error parsing login request body", e);
-            return newFixedLengthResponse(Status.INTERNAL_ERROR, "text/plain", "Error processing request.");
         }
     }
 
     /**
-     * Handles a GET request to /battery to get device battery status.
+     * Routes incoming requests to the correct handler function.
      */
-    private Response handleBatteryRequest() {
-        IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-        Intent batteryStatusIntent = context.registerReceiver(null, ifilter);
+    private suspend fun handleRequest(session: IHTTPSession): Response {
+        val uri = session.uri
+        val method = session.method
+        Log.i("TestServer", "Handling: $method $uri")
 
-        if (batteryStatusIntent == null) {
-            return newFixedLengthResponse(Status.INTERNAL_ERROR, "text/plain", "Could not get battery status.");
+        return when {
+            // Serves the main HTML page
+            method == Method.GET && uri == "/" -> serveHtmlPage(session)
+
+            // Handles secure user login and token generation
+            method == Method.POST && uri == "/login" -> handleSecureLogin(session)
+
+            // Handles secure image upload and recognition
+            method == Method.POST && uri == "/recognize" -> handleSecureRecognition(session)
+
+            // Handles secure battery status requests
+            method == Method.GET && uri == "/battery" -> handleSecureBatteryRequest(session)
+
+            // Catches any other unhandled requests
+            else -> {
+                Log.w("TestServer", "Unhandled request for URI: $uri")
+                addCorsHeaders(
+                    newFixedLengthResponse(
+                        Response.Status.NOT_FOUND,
+                        "text/plain",
+                        "Error: The requested resource was not found."
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * Serves the login.html file statically. No IP injection is needed.
+     */
+    private fun serveHtmlPage(session: IHTTPSession): Response {
+        return try {
+            val html = context.assets.open("login.html").use {
+                it.bufferedReader().readText()
+            }
+            addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/html", html))
+        } catch (e: IOException) {
+            Log.e("TestServer", "Could not serve login.html", e)
+            addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Could not load main page."))
+        }
+    }
+
+    /**
+     * Handles user login, validates credentials, and returns an auth token.
+     */
+    private suspend fun handleSecureLogin(session: IHTTPSession): Response {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Add session.parseBody() to read POST data ---
+                val files = mutableMapOf<String, String>()
+                session.parseBody(files)
+
+                // Now, session.parameters will be correctly populated
+                val params = session.parameters
+                val username = params["username"]?.firstOrNull()
+                val password = params["password"]?.firstOrNull()
+
+                if (username.isNullOrEmpty() || password.isNullOrEmpty()) {
+                    addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Username and password are required."))
+                } else {
+                    val user = userDao.findByUsername(username)
+                    if (user != null && password == user.passwordHash) {
+                        val token = generateNewToken()
+                        activeTokens.add(token)
+                        Log.i("TestServer", "Login successful for '$username'. Issued token.")
+                        val jsonResponse = "{\"token\": \"$token\"}"
+                        addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
+                    } else {
+                        Log.w("TestServer", "Login failed for user '$username'.")
+                        addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid username or password."))
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("TestServer", "Error during login", e)
+                addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "An internal error occurred during login."))
+            }
+        }
+    }
+
+    /**
+     * A security gateway for the image recognition endpoint.
+     */
+    private suspend fun handleSecureRecognition(session: IHTTPSession): Response {
+        if (!isTokenValid(session)) {
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
+        }
+        Log.i("TestServer", "Token valid, proceeding with recognition.")
+        return handleRecognition(session)
+    }
+
+    /**
+     * Handles the actual image processing after security checks have passed.
+     */
+    private suspend fun handleRecognition(session: IHTTPSession): Response {
+        return withContext(Dispatchers.IO) {
+            try {
+                val files = mutableMapOf<String, String>()
+                session.parseBody(files)
+
+                val tempImageFilePath = files["imageFile"] // This is the temporary path
+                if (tempImageFilePath.isNullOrEmpty()) {
+                    return@withContext addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "No image file was uploaded."))
+                }
+
+                // COPY THE TEMPORARY FILE TO A PERMANENT LOCATION
+                val tempFile = File(tempImageFilePath)
+
+                // Create a permanent directory in your app's internal storage
+                val permanentImageDir = File(context.filesDir, "images")
+                if (!permanentImageDir.exists()) {
+                    permanentImageDir.mkdirs()
+                }
+
+                // Create a unique file name for the permanent copy
+                val permanentFile = File(permanentImageDir, "img_${System.currentTimeMillis()}.jpg")
+
+                // Copy the contents of the temp file to the permanent file
+                tempFile.copyTo(permanentFile, overwrite = true)
+
+                // From now on, use the permanent path for everything
+                val permanentImagePath = permanentFile.absolutePath
+                Log.i("TestServer", "Copied uploaded image to permanent path: $permanentImagePath")
+
+                // Now, decode the bitmap from the PERMANENT path
+                val bitmap = BitmapFactory.decodeFile(permanentImagePath)
+                if (bitmap == null) {
+                    return@withContext addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Failed to decode the copied image."))
+                }
+
+                val tensorImage = TensorImage.fromBitmap(bitmap)
+                val results: List<Detection> = getDetector(context).detect(tensorImage)
+
+                val predictions = results.flatMap { detection ->
+                    detection.categories.map { category ->
+                        Prediction(category.label, category.score)
+                    }
+                }
+                val jsonResponse = gson.toJson(predictions)
+                Log.i("TestServer", "Detection complete. Found: ${predictions.joinToString { it.label }}")
+
+                val recognizedObjectsStr = predictions.joinToString(", ") { it.label }
+                if (recognizedObjectsStr.isNotEmpty()) {
+                    val recognitionResult =
+                        com.example.android_helloworld.db.RecognitionResult( // Explicitly using your new class
+                            timestamp = System.currentTimeMillis(),
+                            imagePath = permanentImagePath,
+                            recognizedObjects = recognizedObjectsStr
+                        )
+                    userDao.insertRecognitionResult(recognitionResult)
+                    Log.i("TestServer", "Recognition result saved to database.")
+                }
+
+                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
+
+            } catch (e: Exception) {
+                Log.e("TestServer", "Error during image recognition", e)
+                addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error processing image: ${e.message}"))
+            }
+        }
+    }
+
+    /**
+     * A security gateway for the battery status endpoint.
+     */
+    private fun handleSecureBatteryRequest(session: IHTTPSession): Response {
+        if (!isTokenValid(session)) {
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
+        }
+        return handleBatteryRequest()
+    }
+
+    /**
+     * Retrieves the device's battery level and charging status.
+     */
+    private fun handleBatteryRequest(): Response {
+        val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val intent = context.registerReceiver(null, intentFilter)
+
+        // Get battery level
+        val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val batteryPct = if (level != -1 && scale != -1) (level / scale.toFloat()) * 100 else -1.0f
+
+        // Get battery status
+        val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+
+        val chargingStatus = when {
+            isCharging -> "Charging"
+            status == BatteryManager.BATTERY_STATUS_DISCHARGING -> "Discharging"
+            else -> "Not Charging"
         }
 
-        int level = batteryStatusIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
-        int scale = batteryStatusIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
-        float batteryPct = (level / (float) scale) * 100;
+        // Create a data class or map for a cleaner JSON structure
+        val batteryData = mapOf(
+            "level" to "%.1f%%".format(batteryPct),
+            "status" to chargingStatus
+        )
 
-        int status = batteryStatusIntent.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
-        String chargingStatus = "Unknown";
-        switch (status) {
-            case BatteryManager.BATTERY_STATUS_CHARGING:
-                chargingStatus = "Charging";
-                break;
-            case BatteryManager.BATTERY_STATUS_DISCHARGING:
-                chargingStatus = "Discharging";
-                break;
-            case BatteryManager.BATTERY_STATUS_FULL:
-                chargingStatus = "Full";
-                break;
-            case BatteryManager.BATTERY_STATUS_NOT_CHARGING:
-                chargingStatus = "Not Charging";
-                break;
-        }
+        val jsonResponse = gson.toJson(batteryData)
+        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
+    }
 
-        // Create a simple JSON response string
-        String jsonResponse = String.format("{\"level\": %.0f, \"status\": \"%s\"}", batteryPct, chargingStatus);
+    // --- SECURITY HELPER FUNCTIONS ---
 
-        Log.i("HelloServer", "Responding to /battery request with: " + jsonResponse);
-        return newFixedLengthResponse(Status.OK, "application/json", jsonResponse);
+    private fun generateNewToken(): String {
+        val random = SecureRandom()
+        val bytes = ByteArray(24)
+        random.nextBytes(bytes)
+        return Base64.encodeToString(bytes, Base64.NO_WRAP)
+    }
+
+    private fun isTokenValid(session: IHTTPSession): Boolean {
+        val authHeader = session.headers["authorization"] ?: return false
+        if (!authHeader.startsWith("Bearer ", ignoreCase = true)) return false
+        val token = authHeader.substringAfter("Bearer ")
+        return activeTokens.contains(token)
+    }
+
+    private fun addCorsHeaders(response: Response): Response {
+        response.addHeader("Access-Control-Allow-Origin", "*")
+        response.addHeader("Access-Control-Allow-Headers", "origin, x-requested-with, content-type, accept, Authorization")
+        response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        return response
     }
 }
