@@ -36,6 +36,8 @@ class MainActivity : ComponentActivity() {
         RecognitionViewModelFactory(db.userDao())
     }
 
+    private var serviceAnnouncer: ServiceAnnouncer? = null // edge service announcer
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -74,6 +76,10 @@ class MainActivity : ComponentActivity() {
                 server?.start()
                 Log.i("MainActivity", "Server started successfully on port 8080.")
 
+                serviceAnnouncer = ServiceAnnouncer(applicationContext)
+                serviceAnnouncer?.registerService(8080) // Use the same port as the server.
+                Log.i("MainActivity", "Service announcer initialized and service registration requested.")
+
             } catch (e: IOException) {
                 Log.e("MainActivity", "Server failed to start.", e)
             } catch (e: Exception) {
@@ -89,5 +95,7 @@ class MainActivity : ComponentActivity() {
             server?.stop()
             Log.i("MainActivity", "Server stopped.")
         }
+        serviceAnnouncer?.unregisterService()
+        Log.i("MainActivity", "Service announcer stopped.")
     }
 }

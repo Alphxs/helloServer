@@ -102,6 +102,8 @@ class testServer(
             // Handles secure battery status requests
             method == Method.GET && uri == "/battery" -> handleSecureBatteryRequest(session)
 
+            method == Method.GET && uri == "/status" -> handleBatteryRequest()
+
             // Catches any other unhandled requests
             else -> {
                 Log.w("TestServer", "Unhandled request for URI: $uri")
