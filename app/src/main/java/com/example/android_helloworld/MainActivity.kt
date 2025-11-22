@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
+import com.example.android_helloworld.helpers.getIpAddress
 
 class MainActivity : ComponentActivity() {
 
@@ -56,6 +57,8 @@ class MainActivity : ComponentActivity() {
         // Use a dedicated CoroutineScope for the server's lifecycle.
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                val edgeIpAddress = getIpAddress(applicationContext)
+
                 // Ensure the directory for storing uploaded images exists.
                 val imageDir = File(filesDir, "images")
                 if (!imageDir.exists()) {
@@ -77,7 +80,7 @@ class MainActivity : ComponentActivity() {
                 Log.i("MainActivity", "Server started successfully on port 8080.")
 
                 serviceAnnouncer = ServiceAnnouncer(applicationContext)
-                serviceAnnouncer?.registerService(8080) // Use the same port as the server.
+                serviceAnnouncer?.registerService(8080, edgeIpAddress)
                 Log.i("MainActivity", "Service announcer initialized and service registration requested.")
 
             } catch (e: IOException) {

@@ -15,8 +15,9 @@ class ServiceAnnouncer(private val context: Context) {
         const val SERVICE_TYPE = "_proxy-edge._tcp."
     }
 
-    fun registerService(port: Int) {
-        serviceName = "EdgeServer-${(1000..9999).random()}"
+    fun registerService(port: Int, ipAddress: String?) {
+        val parsableIp = ipAddress?.replace('.', '-')
+        serviceName = "EdgeServer_$parsableIp"
         Log.i("ServiceAnnouncer", "Registering service: name=$serviceName, type=$SERVICE_TYPE, port=$port")
 
         if (serviceName.isNullOrEmpty() || SERVICE_TYPE.isBlank()) {
