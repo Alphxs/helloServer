@@ -10,7 +10,7 @@ import kotlinx.coroutines.flow.Flow
 interface UserDao {
     // Finds a user by their username. Returns null if not found.
     @Query("SELECT * FROM users WHERE username = :username LIMIT 1")
-    fun findByUsername(username: String): User?
+    suspend fun findByUsername(username: String): User?
 
     // Inserts a new user. Ignores the insert if the username already exists.
     @Insert(onConflict = OnConflictStrategy.Companion.IGNORE)

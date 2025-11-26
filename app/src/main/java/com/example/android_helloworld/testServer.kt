@@ -3,25 +3,22 @@ package com.example.android_helloworld
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.BitmapFactory
 import android.os.BatteryManager
 import android.util.Base64
 import android.util.Log
 import com.example.android_helloworld.db.UserDao
 import com.google.gson.Gson
-import com.google.mlkit.vision.digitalink.common.RecognitionResult
 import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
-import org.tensorflow.lite.support.image.TensorImage
-import org.tensorflow.lite.task.vision.detector.Detection
-import org.tensorflow.lite.task.vision.detector.ObjectDetector
 import java.io.File
 import java.io.IOException
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.io.path.exists
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 // Data class for sending predictions back as JSON
 data class Prediction(val label: String, val score: Float)
@@ -34,31 +31,19 @@ class testServer(
 
     private val activeTokens = ConcurrentHashMap.newKeySet<String>()
     private val gson = Gson()
+    private val recognizer: ImageRecognizer
 
-    companion object {
-        @Volatile
-        private var objectDetector: ObjectDetector? = null
+    init {
+        // Create the single recognizer instance.
+        recognizer = ImageRecognizer(context, userDao)
+        // Start the recognition queue with the recognizer instance.
+        RecognitionTaskQueue.start(recognizer)
+    }
 
-        // Singleton pattern to ensure the expensive model is loaded only once.
-        fun getDetector(applicationContext: Context): ObjectDetector {
-            return objectDetector ?: synchronized(this) {
-                objectDetector ?: run {
-                    Log.i("TestServer", "Initializing ObjectDetector singleton...")
-                    val options = ObjectDetector.ObjectDetectorOptions.builder()
-                        .setMaxResults(5)
-                        .setScoreThreshold(0.5f)
-                        .build()
-                    ObjectDetector.createFromFileAndOptions(
-                        applicationContext,
-                        "model_detection.tflite", // Ensure this model is in app/src/main/assets
-                        options
-                    ).also {
-                        objectDetector = it
-                        Log.i("TestServer", "ObjectDetector initialized successfully.")
-                    }
-                }
-            }
-        }
+    override fun stop() {
+        super.stop()
+        // Ensure the queue is stopped when the server stops.
+        RecognitionTaskQueue.stop()
     }
 
     /**
@@ -90,42 +75,21 @@ class testServer(
         Log.i("TestServer", "Handling: $method $uri")
 
         return when {
-            // Serves the main HTML page
-            method == Method.GET && uri == "/" -> serveHtmlPage(session)
-
-            // Handles secure user login and token generation
+            method == Method.GET && uri == "/" -> serveHtmlPage()
             method == Method.POST && uri == "/login" -> handleSecureLogin(session)
-
-            // Handles secure image upload and recognition
             method == Method.POST && uri == "/recognize" -> handleSecureRecognition(session)
-
-            // Handles secure battery status requests
             method == Method.GET && uri == "/battery" -> handleSecureBatteryRequest(session)
-
             method == Method.GET && uri == "/status" -> handleBatteryRequest()
-
-            // Catches any other unhandled requests
             else -> {
                 Log.w("TestServer", "Unhandled request for URI: $uri")
-                addCorsHeaders(
-                    newFixedLengthResponse(
-                        Response.Status.NOT_FOUND,
-                        "text/plain",
-                        "Error: The requested resource was not found."
-                    )
-                )
+                addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: The requested resource was not found."))
             }
         }
     }
 
-    /**
-     * Serves the login.html file statically. No IP injection is needed.
-     */
-    private fun serveHtmlPage(session: IHTTPSession): Response {
+    private fun serveHtmlPage(): Response {
         return try {
-            val html = context.assets.open("login.html").use {
-                it.bufferedReader().readText()
-            }
+            val html = context.assets.open("login.html").use { it.bufferedReader().readText() }
             addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/html", html))
         } catch (e: IOException) {
             Log.e("TestServer", "Could not serve login.html", e)
@@ -133,128 +97,91 @@ class testServer(
         }
     }
 
-    /**
-     * Handles user login, validates credentials, and returns an auth token.
-     */
     private suspend fun handleSecureLogin(session: IHTTPSession): Response {
-        return withContext(Dispatchers.IO) {
-            try {
-                // Add session.parseBody() to read POST data ---
-                val files = mutableMapOf<String, String>()
-                session.parseBody(files)
+        return try {
+            val files = mutableMapOf<String, String>()
+            session.parseBody(files)
+            val params = session.parameters
+            val username = params["username"]?.firstOrNull()
+            val password = params["password"]?.firstOrNull()
 
-                // Now, session.parameters will be correctly populated
-                val params = session.parameters
-                val username = params["username"]?.firstOrNull()
-                val password = params["password"]?.firstOrNull()
-
-                if (username.isNullOrEmpty() || password.isNullOrEmpty()) {
-                    addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Username and password are required."))
+            if (username.isNullOrEmpty() || password.isNullOrEmpty()) {
+                addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Username and password are required."))
+            } else {
+                val user = userDao.findByUsername(username)
+                if (user != null && password == user.passwordHash) {
+                    val token = generateNewToken()
+                    activeTokens.add(token)
+                    Log.i("TestServer", "Login successful for '$username'. Issued token.")
+                    val jsonResponse = "{\"token\": \"$token\"}"
+                    addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
                 } else {
-                    val user = userDao.findByUsername(username)
-                    if (user != null && password == user.passwordHash) {
-                        val token = generateNewToken()
-                        activeTokens.add(token)
-                        Log.i("TestServer", "Login successful for '$username'. Issued token.")
-                        val jsonResponse = "{\"token\": \"$token\"}"
-                        addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
-                    } else {
-                        Log.w("TestServer", "Login failed for user '$username'.")
-                        addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid username or password."))
-                    }
+                    Log.w("TestServer", "Login failed for user '$username'.")
+                    addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid username or password."))
                 }
-            } catch (e: Exception) {
-                Log.e("TestServer", "Error during login", e)
-                addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "An internal error occurred during login."))
             }
+        } catch (e: Exception) {
+            Log.e("TestServer", "Error during login", e)
+            addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "An internal error occurred during login."))
         }
     }
 
-    /**
-     * A security gateway for the image recognition endpoint.
-     */
-    private suspend fun handleSecureRecognition(session: IHTTPSession): Response {
+    private fun handleSecureRecognition(session: IHTTPSession): Response {
         if (!isTokenValid(session)) {
             return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
         }
-        Log.i("TestServer", "Token valid, proceeding with recognition.")
+        Log.i("TestServer", "Token valid, proceeding to queue recognition task.")
         return handleRecognition(session)
     }
 
-    /**
-     * Handles the actual image processing after security checks have passed.
-     */
-    private suspend fun handleRecognition(session: IHTTPSession): Response {
-        return withContext(Dispatchers.IO) {
-            try {
-                val files = mutableMapOf<String, String>()
-                session.parseBody(files)
-
-                val tempImageFilePath = files["imageFile"] // This is the temporary path
-                if (tempImageFilePath.isNullOrEmpty()) {
-                    return@withContext addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "No image file was uploaded."))
-                }
-
-                // COPY THE TEMPORARY FILE TO A PERMANENT LOCATION
-                val tempFile = File(tempImageFilePath)
-
-                // Create a permanent directory in your app's internal storage
-                val permanentImageDir = File(context.filesDir, "images")
-                if (!permanentImageDir.exists()) {
-                    permanentImageDir.mkdirs()
-                }
-
-                // Create a unique file name for the permanent copy
-                val permanentFile = File(permanentImageDir, "img_${System.currentTimeMillis()}.jpg")
-
-                // Copy the contents of the temp file to the permanent file
-                tempFile.copyTo(permanentFile, overwrite = true)
-
-                // From now on, use the permanent path for everything
-                val permanentImagePath = permanentFile.absolutePath
-                Log.i("TestServer", "Copied uploaded image to permanent path: $permanentImagePath")
-
-                // Now, decode the bitmap from the PERMANENT path
-                val bitmap = BitmapFactory.decodeFile(permanentImagePath)
-                if (bitmap == null) {
-                    return@withContext addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Failed to decode the copied image."))
-                }
-
-                val tensorImage = TensorImage.fromBitmap(bitmap)
-                val results: List<Detection> = getDetector(context).detect(tensorImage)
-
-                val predictions = results.flatMap { detection ->
-                    detection.categories.map { category ->
-                        Prediction(category.label, category.score)
-                    }
-                }
-                val jsonResponse = gson.toJson(predictions)
-                Log.i("TestServer", "Detection complete. Found: ${predictions.joinToString { it.label }}")
-
-                val recognizedObjectsStr = predictions.joinToString(", ") { it.label }
-                if (recognizedObjectsStr.isNotEmpty()) {
-                    val recognitionResult =
-                        com.example.android_helloworld.db.RecognitionResult( // Explicitly using your new class
-                            timestamp = System.currentTimeMillis(),
-                            imagePath = permanentImagePath,
-                            recognizedObjects = recognizedObjectsStr
-                        )
-                    userDao.insertRecognitionResult(recognitionResult)
-                    Log.i("TestServer", "Recognition result saved to database.")
-                }
-
-                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
-
-            } catch (e: Exception) {
-                Log.e("TestServer", "Error during image recognition", e)
-                addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error processing image: ${e.message}"))
+    private fun handleRecognition(session: IHTTPSession): Response {
+        try {
+            val files = mutableMapOf<String, String>()
+            session.parseBody(files)
+            val tempImageFilePath = files["imageFile"]
+            if (tempImageFilePath.isNullOrEmpty()) {
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "No image file was uploaded."))
             }
+
+            val tempFile = File(tempImageFilePath)
+            val permanentImageDir = File(context.filesDir, "images").apply { mkdirs() }
+            val permanentFile = File(permanentImageDir, "img_${System.currentTimeMillis()}.jpg")
+            tempFile.copyTo(permanentFile, overwrite = true)
+            Log.i("TestServer", "Copied uploaded image to permanent path: ${permanentFile.absolutePath}")
+
+            val latch = CountDownLatch(1)
+            var responseJson = ""
+            var responseStatus = Response.Status.OK
+
+            val task = RecognitionTask(
+                imageFile = permanentFile,
+                onComplete = { result ->
+                    responseJson = result
+                    latch.countDown()
+                },
+                onError = { errorMessage ->
+                    responseJson = gson.toJson(mapOf("error" to errorMessage))
+                    responseStatus = Response.Status.INTERNAL_ERROR
+                    latch.countDown()
+                }
+            )
+
+            CoroutineScope(Dispatchers.IO).launch { RecognitionTaskQueue.submitTask(task) }
+
+            val completedInTime = latch.await(30, TimeUnit.SECONDS)
+
+            return if (completedInTime) {
+                addCorsHeaders(newFixedLengthResponse(responseStatus, "application/json", responseJson))
+            } else {
+                Log.e("TestServer", "Recognition task timed out after 30 seconds.")
+                addCorsHeaders(newFixedLengthResponse(Response.Status.REQUEST_TIMEOUT, "application/json", gson.toJson(mapOf("error" to "Processing timed out."))))
+            }
+        } catch (e: Exception) {
+            Log.e("TestServer", "Error handling recognition request", e)
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error processing image: ${e.message}"))
         }
     }
 
-    /**
-     * A security gateway for the battery status endpoint.
-     */
     private fun handleSecureBatteryRequest(session: IHTTPSession): Response {
         if (!isTokenValid(session)) {
             return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
@@ -262,40 +189,23 @@ class testServer(
         return handleBatteryRequest()
     }
 
-    /**
-     * Retrieves the device's battery level and charging status.
-     */
     private fun handleBatteryRequest(): Response {
         val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
         val intent = context.registerReceiver(null, intentFilter)
-
-        // Get battery level
         val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
         val batteryPct = if (level != -1 && scale != -1) (level / scale.toFloat()) * 100 else -1.0f
-
-        // Get battery status
         val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                status == BatteryManager.BATTERY_STATUS_FULL
-
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
         val chargingStatus = when {
             isCharging -> "Charging"
             status == BatteryManager.BATTERY_STATUS_DISCHARGING -> "Discharging"
             else -> "Not Charging"
         }
-
-        // Create a data class or map for a cleaner JSON structure
-        val batteryData = mapOf(
-            "level" to "%.1f%%".format(batteryPct),
-            "status" to chargingStatus
-        )
-
+        val batteryData = mapOf("level" to "%.1f%%".format(batteryPct), "status" to chargingStatus)
         val jsonResponse = gson.toJson(batteryData)
         return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
     }
-
-    // --- SECURITY HELPER FUNCTIONS ---
 
     private fun generateNewToken(): String {
         val random = SecureRandom()
