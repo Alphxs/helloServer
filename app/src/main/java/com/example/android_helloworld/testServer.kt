@@ -201,7 +201,8 @@ class testServer(
             // Open an input stream from the assets folder.
             // This will throw an IOException if the file does not exist.
             val fileInputStream = context.assets.open(filename)
-            val fileSize = context.assets.openFd(filename).length
+            // Use .available() to get the size of the stream, which works for compressed assets.
+            val fileSize = fileInputStream.available().toLong()
 
             Log.i("TestServer", "Serving asset file for download: $filename")
 
