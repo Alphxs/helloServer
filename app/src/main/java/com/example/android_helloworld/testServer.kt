@@ -80,6 +80,7 @@ class testServer(
             method == Method.POST && uri == "/recognize" -> handleSecureRecognition(session)
             method == Method.GET && uri == "/battery" -> handleSecureBatteryRequest(session)
             method == Method.GET && uri == "/status" -> handleBatteryRequest()
+            method == Method.GET && uri == "/download" -> handleFileDownload(session)
             else -> {
                 Log.w("TestServer", "Unhandled request for URI: $uri")
                 addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: The requested resource was not found."))
@@ -127,10 +128,10 @@ class testServer(
     }
 
     private fun handleSecureRecognition(session: IHTTPSession): Response {
-        if (!isTokenValid(session)) {
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
-        }
-        Log.i("TestServer", "Token valid, proceeding to queue recognition task.")
+//        if (!isTokenValid(session)) {
+//            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
+//        }
+//        Log.i("TestServer", "Token valid, proceeding to queue recognition task.")
         return handleRecognition(session)
     }
 
@@ -182,10 +183,48 @@ class testServer(
         }
     }
 
-    private fun handleSecureBatteryRequest(session: IHTTPSession): Response {
-        if (!isTokenValid(session)) {
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
+    private fun handleFileDownload(session: IHTTPSession): Response {
+        val params = session.parameters
+        val filename = params["file"]?.firstOrNull()
+
+        if (filename.isNullOrEmpty()) {
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Error: 'file' parameter is missing."))
         }
+
+        try {
+            // Prevent directory traversal
+            if (filename.contains("/") || filename.contains("\\")) {
+                Log.e("TestServer", "Security Alert: Path characters detected in filename: $filename")
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Error: Invalid filename."))
+            }
+
+            // Open an input stream from the assets folder.
+            // This will throw an IOException if the file does not exist.
+            val fileInputStream = context.assets.open(filename)
+            val fileSize = context.assets.openFd(filename).length
+
+            Log.i("TestServer", "Serving asset file for download: $filename")
+
+            // Serve the file. NanoHTTPD will handle closing the stream.
+            // "application/octet-stream" forces a download prompt.
+            val response = newFixedLengthResponse(Response.Status.OK, "application/octet-stream", fileInputStream, fileSize)
+
+            // This header suggests a filename to the browser for the "Save As" dialog.
+            response.addHeader("Content-Disposition", "attachment; filename=\"$filename\"")
+
+            return addCorsHeaders(response)
+
+        } catch (e: IOException) {
+            // This catch block will handle the case where the asset does not exist.
+            Log.w("TestServer", "Asset file not found for download: $filename", e)
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: Asset file not found."))
+        }
+    }
+
+    private fun handleSecureBatteryRequest(session: IHTTPSession): Response {
+//        if (!isTokenValid(session)) {
+//            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
+//        }
         return handleBatteryRequest()
     }
 
