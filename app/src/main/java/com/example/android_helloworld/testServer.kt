@@ -9,16 +9,12 @@ import android.util.Log
 import com.example.android_helloworld.db.UserDao
 import com.google.gson.Gson
 import fi.iki.elonen.NanoHTTPD
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import java.io.IOException
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 // Data class for sending predictions back as JSON
 data class Prediction(val label: String, val score: Float)
@@ -29,21 +25,18 @@ class testServer(
     port: Int
 ) : NanoHTTPD(port) {
 
+    private val taskResults = ConcurrentHashMap<String, String>()
+    @Volatile private var cachedBatteryJson: String? = null
+    @Volatile private var lastBatteryFetchTime: Long = 0
+    private val batteryCacheDurationMs = 1000 // Cache for 1 second
+
     private val activeTokens = ConcurrentHashMap.newKeySet<String>()
     private val gson = Gson()
-    private val recognizer: ImageRecognizer
-
-    init {
-        // Create the single recognizer instance.
-        recognizer = ImageRecognizer(context, userDao)
-        // Start the recognition queue with the recognizer instance.
-        RecognitionTaskQueue.start(recognizer)
-    }
 
     override fun stop() {
         super.stop()
         // Ensure the queue is stopped when the server stops.
-        RecognitionTaskQueue.stop()
+//        RecognitionTaskQueue.stop()
     }
 
     /**
@@ -80,6 +73,7 @@ class testServer(
             method == Method.POST && uri == "/recognize" -> handleSecureRecognition(session)
             method == Method.GET && uri == "/battery" -> handleSecureBatteryRequest(session)
             method == Method.GET && uri == "/status" -> handleBatteryRequest()
+            method == Method.GET && uri.startsWith("/result/") -> handleResultRequest(uri)
             method == Method.GET && uri == "/download" -> handleFileDownload(session)
             else -> {
                 Log.w("TestServer", "Unhandled request for URI: $uri")
@@ -127,7 +121,7 @@ class testServer(
         }
     }
 
-    private fun handleSecureRecognition(session: IHTTPSession): Response {
+    private suspend fun handleSecureRecognition(session: IHTTPSession): Response {
 //        if (!isTokenValid(session)) {
 //            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
 //        }
@@ -135,7 +129,10 @@ class testServer(
         return handleRecognition(session)
     }
 
-    private fun handleRecognition(session: IHTTPSession): Response {
+    private suspend fun handleRecognition(session: IHTTPSession): Response {
+        val processStartTime = System.currentTimeMillis()
+        Log.i("TestServer", "Time: 0ms - Recognition process started.")
+
         try {
             val files = mutableMapOf<String, String>()
             session.parseBody(files)
@@ -144,44 +141,60 @@ class testServer(
                 return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "No image file was uploaded."))
             }
 
+            val afterParseTime = System.currentTimeMillis()
+            Log.i("TestServer", "Time: ${afterParseTime - processStartTime}ms - Request body parsed.")
+
             val tempFile = File(tempImageFilePath)
             val permanentImageDir = File(context.filesDir, "images").apply { mkdirs() }
             val permanentFile = File(permanentImageDir, "img_${System.currentTimeMillis()}.jpg")
             tempFile.copyTo(permanentFile, overwrite = true)
-            Log.i("TestServer", "Copied uploaded image to permanent path: ${permanentFile.absolutePath}")
 
-            val latch = CountDownLatch(1)
-            var responseJson = ""
-            var responseStatus = Response.Status.OK
+            val afterFileCopyTime = System.currentTimeMillis()
+            Log.i("TestServer", "Time: ${afterFileCopyTime - processStartTime}ms - Image file saved to permanent storage at: ${permanentFile.absolutePath}")
 
-            val task = RecognitionTask(
-                imageFile = permanentFile,
+            // --- NEW LOGIC: Create Recognizer and Task ID here ---
+            val taskId = java.util.UUID.randomUUID().toString()
+
+            // 1. Create a new ImageRecognizer instance for this specific request.
+            val perRequestRecognizer = ImageRecognizer(context, userDao)
+
+            val afterRecognizerCreationTime = System.currentTimeMillis()
+            Log.i("TestServer", "Time: ${afterRecognizerCreationTime - processStartTime}ms - Created new ImageRecognizer for task $taskId.")
+
+            // 2. Delegate the work directly to the new instance.
+            perRequestRecognizer.processImage(
+                permanentImageFile = permanentFile,
                 onComplete = { result ->
-                    responseJson = result
-                    latch.countDown()
+                    val completionTime = System.currentTimeMillis()
+                    Log.i("TestServer", "Task $taskId completed successfully. Total time from request start to completion: ${completionTime - processStartTime}ms.")
+                    taskResults[taskId] = result
                 },
                 onError = { errorMessage ->
-                    responseJson = gson.toJson(mapOf("error" to errorMessage))
-                    responseStatus = Response.Status.INTERNAL_ERROR
-                    latch.countDown()
+                    val errorTime = System.currentTimeMillis()
+                    Log.e("TestServer", "Task $taskId failed. Total time from request start to failure: ${errorTime - processStartTime}ms. Error: $errorMessage")
+                    val errorJson = gson.toJson(mapOf("error" to errorMessage))
+                    taskResults[taskId] = errorJson
                 }
             )
 
-            CoroutineScope(Dispatchers.IO).launch { RecognitionTaskQueue.submitTask(task) }
+            // --- IMMEDIATE RESPONSE ---
+            // Immediately return the task ID to the client. This does not change.
+            val responseJson = gson.toJson(mapOf("taskId" to taskId, "status" to "queued"))
 
-            val completedInTime = latch.await(30, TimeUnit.SECONDS)
+            val immediateResponseTime = System.currentTimeMillis()
+            Log.i("TestServer", "Time: ${immediateResponseTime - processStartTime}ms - Task $taskId queued. Returning immediate response to client.")
 
-            return if (completedInTime) {
-                addCorsHeaders(newFixedLengthResponse(responseStatus, "application/json", responseJson))
-            } else {
-                Log.e("TestServer", "Recognition task timed out after 30 seconds.")
-                addCorsHeaders(newFixedLengthResponse(Response.Status.REQUEST_TIMEOUT, "application/json", gson.toJson(mapOf("error" to "Processing timed out."))))
-            }
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.ACCEPTED, "application/json", responseJson))
+
         } catch (e: Exception) {
-            Log.e("TestServer", "Error handling recognition request", e)
+            val exceptionTime = System.currentTimeMillis()
+            Log.e("TestServer", "Time: ${exceptionTime - processStartTime}ms - Error handling recognition request", e)
             return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error processing image: ${e.message}"))
         }
     }
+
+
+
 
     private fun handleFileDownload(session: IHTTPSession): Response {
         val params = session.parameters
@@ -230,22 +243,68 @@ class testServer(
     }
 
     private fun handleBatteryRequest(): Response {
+        val currentTime = System.currentTimeMillis()
+
+        // Check if we have a valid, non-stale cache
+        if (cachedBatteryJson != null && (currentTime - lastBatteryFetchTime) < batteryCacheDurationMs) {
+            Log.i("TestServer", "Serving cached battery status.")
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", cachedBatteryJson))
+        }
+
+        // --- If cache is stale or empty, fetch new data ---
+        Log.i("TestServer", "Fetching new battery status (cache miss or stale).")
         val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
         val intent = context.registerReceiver(null, intentFilter)
+
         val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
         val batteryPct = if (level != -1 && scale != -1) (level / scale.toFloat()) * 100 else -1.0f
+
         val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
         val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+
         val chargingStatus = when {
             isCharging -> "Charging"
             status == BatteryManager.BATTERY_STATUS_DISCHARGING -> "Discharging"
             else -> "Not Charging"
         }
+
         val batteryData = mapOf("level" to "%.1f%%".format(batteryPct), "status" to chargingStatus)
         val jsonResponse = gson.toJson(batteryData)
+
+        // --- Update the cache ---
+        cachedBatteryJson = jsonResponse
+        lastBatteryFetchTime = currentTime
+
         return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
     }
+
+    private fun handleResultRequest(uri: String): Response {
+        val taskId = uri.substringAfter("/result/")
+        if (taskId.isEmpty()) {
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Task ID is missing."))
+        }
+
+        val result = taskResults[taskId]
+
+        return when {
+            // If we have a result for this ID...
+            result != null -> {
+                // ...remove it from the map to clean up and send it to the client.
+                taskResults.remove(taskId)
+                Log.i("TestServer", "Serving result for task $taskId.")
+                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
+            }
+            // If no result is found yet...
+            else -> {
+                // ...tell the client the task is still being processed.
+                Log.i("TestServer", "Result for task $taskId not ready yet.")
+                val pendingJson = gson.toJson(mapOf("taskId" to taskId, "status" to "processing"))
+                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", pendingJson))
+            }
+        }
+    }
+
 
     private fun generateNewToken(): String {
         val random = SecureRandom()

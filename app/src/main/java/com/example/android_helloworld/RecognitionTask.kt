@@ -1,12 +1,13 @@
-package com.example.android_helloworld
-
-import java.io.File
-
-/**
- * A data class to hold all the necessary information for a single
- * image recognition task.
- */
-data class RecognitionTask(val imageFile: File,
-                           val onComplete: (String) -> Unit,
-                           val onError: (String) -> Unit
-)
+//package com.example.android_helloworld
+//
+//import java.io.File
+//import java.util.UUID
+//
+//// Add a unique ID to the RecognitionTask
+//data class RecognitionTask(
+//    val taskId: String = UUID.randomUUID().toString(), // <-- ADD THIS LINE
+//    val imageFile: File,
+//    val onComplete: (String) -> Unit,
+//    val onError: (String) -> Unit
+//)
+//

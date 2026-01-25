@@ -39,7 +39,11 @@ class ImageRecognizer(context: Context, private val userDao: UserDao) {
      * Processes a single image file, runs detection, saves the result, and returns a JSON string.
      * This method is NOT thread-safe and should only be called from a single thread at a time.
      */
-    suspend fun processImage(permanentImageFile: File): String {
+    suspend fun processImage(
+    permanentImageFile: File,
+    onComplete: (String) -> Unit,
+    onError: (String) -> Unit,
+    ): String {
         val bitmap = BitmapFactory.decodeFile(permanentImageFile.absolutePath)
         if (bitmap == null) {
             throw IOException("Failed to decode the image file.")
