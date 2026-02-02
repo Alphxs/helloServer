@@ -10,13 +10,14 @@ import org.tensorflow.lite.task.vision.detector.Detection
 import org.tensorflow.lite.task.vision.detector.ObjectDetector
 import java.io.File
 import java.io.IOException
+import java.io.Closeable
 
 /**
  * Encapsulates the logic for image recognition. It loads the model and provides
  * a method to perform detection on an image file. This class is NOT thread-safe
  * on its own and should be used by a queuing mechanism like RecognitionTaskQueue.
  */
-class ImageRecognizer(context: Context, private val userDao: UserDao) {
+class ImageRecognizer(context: Context, private val userDao: UserDao): Closeable {
 
     private val gson = Gson()
     private val objectDetector: ObjectDetector
@@ -33,6 +34,11 @@ class ImageRecognizer(context: Context, private val userDao: UserDao) {
             options
         )
         Log.i("ImageRecognizer", "ObjectDetector initialized successfully.")
+
+        }
+    override fun close() {
+        objectDetector?.close()
+        Log.i("ImageRecognizer", "ObjectDetector has been closed.")
     }
 
     /**
@@ -40,9 +46,7 @@ class ImageRecognizer(context: Context, private val userDao: UserDao) {
      * This method is NOT thread-safe and should only be called from a single thread at a time.
      */
     suspend fun processImage(
-    permanentImageFile: File,
-    onComplete: (String) -> Unit,
-    onError: (String) -> Unit,
+        permanentImageFile: File,
     ): String {
         val bitmap = BitmapFactory.decodeFile(permanentImageFile.absolutePath)
         if (bitmap == null) {

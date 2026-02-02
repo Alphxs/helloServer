@@ -1,0 +1,38 @@
+Timestamp,Delta_ms,Log_Message
+11:30:31.997,0.00,[SERVER] I TestServer: Handling: POST /set-concurrency
+11:30:32.523,526.00,[CLIENT] [SYSTEM] Starting ADB logcat capture to 'logcat_output.log'...
+11:30:33.536,1013.00,[SERVER] I TestServer: Handling: POST /recognize
+11:30:33.536,0.00,[SERVER] I TestServer: Handling: POST /recognize for task 8abed61d-725f-4747-9d52-885dec4cfb33
+11:30:33.632,96.00,[CLIENT] [SYSTEM] --- Setting server max concurrency to 1... ---
+11:30:34.297,665.00,[CLIENT] [SYSTEM] ✅ Server concurrency set to 1.
+11:30:34.298,1.00,[CLIENT] [CLIENT] [MAIN] --- Starting continuous loops of queue status tasks... ---
+11:30:35.298,1000.00,[CLIENT] [CLIENT] [MAIN] --- Starting long recognition tasks... ---
+11:30:35.299,1.00,[CLIENT] [CLIENT] --> Sending request...
+11:30:35.499,200.00,[CLIENT] [CLIENT] [MAIN] --- Main thread is now waiting for all long tasks to finish polling... ---
+11:30:39.578,4079.00,[SERVER] I TestServer: Task queued. Copied to /data/user/0/com.example.android_helloworld/files/images/img_8abed61d-725f-4747-9d52-885dec4cfb33.jpg
+11:30:39.579,1.00,[SERVER] I TestServer: Task is now waiting for a permit. (Queued: 1)
+11:30:39.580,1.00,"[SERVER] I TestServer: Permit acquired, now active. (Active: 1, Queued: 0)"
+11:30:39.580,0.00,[SERVER] D TestServer: Starting 8-second artificial delay to test queue...
+11:30:39.580,0.00,[SERVER] D TestServer: Artificial delay finished. Starting actual work.
+11:30:39.581,1.00,[SERVER] I ImageRecognizer: Initializing ObjectDetector...
+11:30:39.593,12.00,[SERVER] I ImageRecognizer: ObjectDetector initialized successfully.
+11:30:39.667,74.00,[SERVER] I TestServer: Handling: GET /result/8abed61d-725f-4747-9d52-885dec4cfb33
+11:30:39.668,1.00,"[SERVER] I TestServer: Serving result: {""taskId"":""8abed61d-725f-4747-9d52-885dec4cfb33"",""status"":""processing""}"
+11:30:41.258,1590.00,[SERVER] I ImageRecognizer: Detection complete. Found: dog
+11:30:41.263,5.00,[SERVER] I ImageRecognizer: Recognition result saved to database.
+11:30:41.265,2.00,[SERVER] I ImageRecognizer: ObjectDetector has been closed.
+11:30:41.269,4.00,[SERVER] I TestServer: Recognition successful.
+11:30:41.269,0.00,"[SERVER] I TestServer: Permit released, task finished. (Active: 0, Queued: 0)"
+11:30:41.767,498.00,[CLIENT] [CLIENT] <--- Initial response received (202).
+11:30:41.767,0.00,[CLIENT] [CLIENT] Got Task ID from server: 8abed61d-725f-4747-9d52-885dec4cfb33
+11:30:41.767,0.00,[CLIENT] [CLIENT] Task accepted. Starting to poll...
+11:30:41.767,0.00,[CLIENT] [CLIENT] Polling URL: http://192.168.50.238:8080/result/8abed61d-725f-4747-9d52-885dec4cfb33
+11:30:41.767,0.00,[CLIENT] [CLIENT] ...polling attempt 1/15
+11:30:41.829,62.00,[SERVER] I TestServer: Handling: GET /result/8abed61d-725f-4747-9d52-885dec4cfb33
+11:30:41.829,0.00,"[SERVER] I TestServer: Serving result: {""label"":""dog"",""score"":0.765625,""taskId"":""8abed61d-725f-4747-9d52-885dec4cfb33"",""status"":""complete""}"
+11:30:41.875,46.00,[CLIENT] [CLIENT] ...status is 'processing'. Waiting for 2s...
+11:30:43.876,2001.00,[CLIENT] [CLIENT] ...polling attempt 2/15
+11:30:44.026,150.00,"[CLIENT] [CLIENT] ✅✅✅ SUCCESS in 8.73s. Result: {'label': 'dog', 'score': 0.765625, 'taskId': '8abed61d-725f-4747-9d52-885dec4cfb33', 'status': 'complete'}"
+11:30:44.028,2.00,[CLIENT] [CLIENT] [MAIN] --- All long tasks finished. Signaling status loopers to stop. ---
+11:30:44.028,0.00,[CLIENT] [SYSTEM] Terminating ADB logcat capture...
+11:30:44.031,3.00,[CLIENT] [SYSTEM] Logcat capture stopped.

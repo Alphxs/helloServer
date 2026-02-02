@@ -15,6 +15,19 @@ import java.io.File
 import java.io.IOException
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
+import java.sql.Types.NULL
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicInteger
+
 
 // Data class for sending predictions back as JSON
 data class Prediction(val label: String, val score: Float)
@@ -24,7 +37,18 @@ class testServer(
     private val userDao: UserDao,
     port: Int
 ) : NanoHTTPD(port) {
+    // --- NEW: Concurrency Control Variables ---
+    @Volatile // Ensures writes are visible across threads
+    private var maxConcurrentTasks = 2 // Default to 2 concurrent tasks
 
+    // A semaphore to limit the number of active recognition tasks.
+    @Volatile
+    private var recognitionSemaphore = Semaphore(maxConcurrentTasks, true) // `true` for fairness
+    private val serverJob = SupervisorJob()
+    private val serverScope = CoroutineScope(Dispatchers.IO + serverJob)
+
+    private val activeProcessingTasks = AtomicInteger(0)
+    private val queuedWaitingTasks = AtomicInteger(0)
     private val taskResults = ConcurrentHashMap<String, String>()
     @Volatile private var cachedBatteryJson: String? = null
     @Volatile private var lastBatteryFetchTime: Long = 0
@@ -71,6 +95,10 @@ class testServer(
             method == Method.GET && uri == "/" -> serveHtmlPage()
             method == Method.POST && uri == "/login" -> handleSecureLogin(session)
             method == Method.POST && uri == "/recognize" -> handleSecureRecognition(session)
+            // --- NEW ROUTES ---
+            method == Method.POST && uri == "/set-concurrency" -> handleConcurrencyChange(session)
+            method == Method.GET && uri == "/queue-status" -> handleQueueStatus()
+            // --- END NEW ---
             method == Method.GET && uri == "/battery" -> handleSecureBatteryRequest(session)
             method == Method.GET && uri == "/status" -> handleBatteryRequest()
             method == Method.GET && uri.startsWith("/result/") -> handleResultRequest(uri)
@@ -121,6 +149,59 @@ class testServer(
         }
     }
 
+    /**
+     * Endpoint to dynamically set the maximum number of concurrent recognition threads.
+     * This is synchronized to prevent race conditions.
+     */
+    private fun handleConcurrencyChange(session: IHTTPSession): Response {
+        // Synchronize to prevent race conditions when changing the semaphore.
+        synchronized(this) {
+            return try {
+                val body = hashMapOf<String, String>()
+                session.parseBody(body)
+                val json = org.json.JSONObject(body["postData"] ?: "{}")
+                val newLimit = json.optInt("maxThreads", -1)
+
+                if (newLimit <= 0) {
+                    return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "'maxThreads' must be a positive integer."))
+                }
+
+                if (newLimit == maxConcurrentTasks) {
+                    return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Concurrency is already set to $newLimit."))
+                }
+
+                Log.w("TestServer", "ADMIN: Changing max concurrency from $maxConcurrentTasks to $newLimit")
+                maxConcurrentTasks = newLimit
+
+                // The new semaphore will immediately apply to the next task waiting to acquire a permit.
+                recognitionSemaphore = Semaphore(newLimit, true)
+
+                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max concurrency successfully set to $newLimit."))
+            } catch (e: Exception) {
+                Log.e("TestServer", "Error setting concurrency", e)
+                addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Failed to parse request."))
+            }
+        }
+    }
+
+
+    /**
+     * Endpoint to report the current status of the recognition queue.
+     */
+    private fun handleQueueStatus(): Response {
+        // This is now the source of truth, no calculation needed.
+        val statusMap = mapOf(
+            "maxConcurrency" to maxConcurrentTasks,
+            "activeProcessingTasks" to activeProcessingTasks.get(),
+            "queuedWaitingTasks" to queuedWaitingTasks.get(),
+        )
+
+        val jsonResponse = gson.toJson(statusMap)
+        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
+    }
+
+
+
     private suspend fun handleSecureRecognition(session: IHTTPSession): Response {
 //        if (!isTokenValid(session)) {
 //            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
@@ -130,9 +211,8 @@ class testServer(
     }
 
     private suspend fun handleRecognition(session: IHTTPSession): Response {
-        val processStartTime = System.currentTimeMillis()
-        Log.i("TestServer", "Time: 0ms - Recognition process started.")
-
+        val taskId = java.util.UUID.randomUUID().toString()
+        Log.i("TestServer", "Handling: ${session.method} ${session.uri} for task $taskId")
         try {
             val files = mutableMapOf<String, String>()
             session.parseBody(files)
@@ -141,57 +221,92 @@ class testServer(
                 return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "No image file was uploaded."))
             }
 
-            val afterParseTime = System.currentTimeMillis()
-            Log.i("TestServer", "Time: ${afterParseTime - processStartTime}ms - Request body parsed.")
-
             val tempFile = File(tempImageFilePath)
             val permanentImageDir = File(context.filesDir, "images").apply { mkdirs() }
-            val permanentFile = File(permanentImageDir, "img_${System.currentTimeMillis()}.jpg")
+            val permanentFile = File(permanentImageDir, "img_${taskId}.jpg")
             tempFile.copyTo(permanentFile, overwrite = true)
 
-            val afterFileCopyTime = System.currentTimeMillis()
-            Log.i("TestServer", "Time: ${afterFileCopyTime - processStartTime}ms - Image file saved to permanent storage at: ${permanentFile.absolutePath}")
+            // 1. Mark the task as "queued" immediately.
+            taskResults[taskId] = gson.toJson(mapOf("taskId" to taskId, "status" to "queued"))
+            Log.i("TestServer", "[$taskId] - Task queued. Copied to ${permanentFile.absolutePath}")
 
-            // --- NEW LOGIC: Create Recognizer and Task ID here ---
-            val taskId = java.util.UUID.randomUUID().toString()
-
-            // 1. Create a new ImageRecognizer instance for this specific request.
-            val perRequestRecognizer = ImageRecognizer(context, userDao)
-
-            val afterRecognizerCreationTime = System.currentTimeMillis()
-            Log.i("TestServer", "Time: ${afterRecognizerCreationTime - processStartTime}ms - Created new ImageRecognizer for task $taskId.")
-
-            // 2. Delegate the work directly to the new instance.
-            perRequestRecognizer.processImage(
-                permanentImageFile = permanentFile,
-                onComplete = { result ->
-                    val completionTime = System.currentTimeMillis()
-                    Log.i("TestServer", "Task $taskId completed successfully. Total time from request start to completion: ${completionTime - processStartTime}ms.")
-                    taskResults[taskId] = result
-                },
-                onError = { errorMessage ->
-                    val errorTime = System.currentTimeMillis()
-                    Log.e("TestServer", "Task $taskId failed. Total time from request start to failure: ${errorTime - processStartTime}ms. Error: $errorMessage")
-                    val errorJson = gson.toJson(mapOf("error" to errorMessage))
-                    taskResults[taskId] = errorJson
+            // 2. Launch the processing task on our controlled dispatcher. It will wait for a permit.
+            serverScope.launch(Dispatchers.IO) {
+                    processRecognitionTask(taskId, permanentFile)
                 }
-            )
 
-            // --- IMMEDIATE RESPONSE ---
-            // Immediately return the task ID to the client. This does not change.
+
+            // 3. Immediately return an ACCEPTED response with the taskId.
             val responseJson = gson.toJson(mapOf("taskId" to taskId, "status" to "queued"))
-
-            val immediateResponseTime = System.currentTimeMillis()
-            Log.i("TestServer", "Time: ${immediateResponseTime - processStartTime}ms - Task $taskId queued. Returning immediate response to client.")
-
             return addCorsHeaders(newFixedLengthResponse(Response.Status.ACCEPTED, "application/json", responseJson))
 
         } catch (e: Exception) {
-            val exceptionTime = System.currentTimeMillis()
-            Log.e("TestServer", "Time: ${exceptionTime - processStartTime}ms - Error handling recognition request", e)
+            Log.e("TestServer", "[$taskId] - Error handling recognition request", e)
+            taskResults.remove(taskId) // Clean up failed task
             return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error processing image: ${e.message}"))
         }
     }
+
+    private suspend fun processRecognitionTask(taskId: String, imageFile: File) {
+        queuedWaitingTasks.incrementAndGet()
+        Log.i("TestServer", "[$taskId] - Task is now waiting for a permit. (Queued: ${queuedWaitingTasks.get()})")
+
+        recognitionSemaphore.acquire()
+        // --- From this point on, a permit is held. We MUST release it in a finally block. ---
+
+        try {
+            // --- STATE UPDATE: Task is now moving from queued to active ---
+            queuedWaitingTasks.decrementAndGet()
+            activeProcessingTasks.incrementAndGet()
+            Log.i("TestServer", "[$taskId] - Permit acquired, now active. (Active: ${activeProcessingTasks.get()}, Queued: ${queuedWaitingTasks.get()})")
+
+            Log.d("TestServer", "[$taskId] - Starting 8-second artificial delay to test queue...")
+//            delay(4000L) // 8-second delay
+            Log.d("TestServer", "[$taskId] - Artificial delay finished. Starting actual work.")
+
+            // --- Use withTimeoutOrNull for the actual work, but handle state outside of it ---
+            val processingResult = withTimeoutOrNull(120000L) { // 120-second timeout
+                ImageRecognizer(context, userDao).use { perRequestRecognizer ->
+                    taskResults[taskId] = gson.toJson(mapOf("taskId" to taskId, "status" to "processing"))
+                    perRequestRecognizer.processImage(imageFile) // Returns the JSON result
+                }
+            }
+
+            // --- After the work is done (or timed out), update the final result ---
+            if (processingResult != null) {
+                // SUCCESS
+                val listType = object : TypeToken<List<Map<String, Any>>>() {}.type
+                val resultsList: List<Map<String, Any>> = gson.fromJson(processingResult, listType)
+
+                if (resultsList.isNotEmpty()) {
+                    val firstResultMap = resultsList[0].toMutableMap()
+                    firstResultMap["taskId"] = taskId
+                    firstResultMap["status"] = "complete"
+                    taskResults[taskId] = gson.toJson(firstResultMap)
+                    Log.i("TestServer", "[$taskId] - Recognition successful.")
+                } else {
+                    taskResults[taskId] = gson.toJson(mapOf("taskId" to taskId, "status" to "error", "message" to "Recognition completed with no results."))
+                    Log.w("TestServer", "[$taskId] - Recognition completed but no results were found.")
+                }
+            } else {
+                // TIMEOUT
+                Log.e("TestServer", "[$taskId] - Task TIMED OUT after 120 seconds.")
+                taskResults[taskId] = gson.toJson(mapOf("taskId" to taskId, "status" to "error", "message" to "Task timed out after 120 seconds."))
+            }
+
+        } catch (e: Exception) {
+            // CATCH ALL OTHER ERRORS (e.g., from ImageRecognizer)
+            Log.e("TestServer", "[$taskId] - A critical error occurred during task processing.", e)
+            taskResults[taskId] = gson.toJson(mapOf("taskId" to taskId, "status" to "error", "message" to (e.message ?: "Unknown recognition error")))
+        } finally {
+            // --- STATE UPDATE: This block ALWAYS runs, guaranteeing cleanup ---
+            // The task is no longer active, regardless of success, failure, or timeout.
+            activeProcessingTasks.decrementAndGet()
+            recognitionSemaphore.release()
+            Log.i("TestServer", "[$taskId] - Permit released, task finished. (Active: ${activeProcessingTasks.get()}, Queued: ${queuedWaitingTasks.get()})")
+        }
+    }
+
 
 
 
@@ -279,31 +394,33 @@ class testServer(
         return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
     }
 
+    /**
+     * Handles polling requests for the result of a specific task.
+     * It extracts the taskId from the URL path.
+     */
     private fun handleResultRequest(uri: String): Response {
-        val taskId = uri.substringAfter("/result/")
-        if (taskId.isEmpty()) {
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Task ID is missing."))
+        // 1. Extract the taskId from the URL (e.g., "/result/some-uuid")
+        val taskId = uri.substringAfterLast('/')
+
+        if (taskId.isBlank()) {
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Task ID is missing from the URL."))
         }
 
-        val result = taskResults[taskId]
+        // 2. Look up the result in our concurrent map.
+        val resultJson = taskResults[taskId]
 
-        return when {
-            // If we have a result for this ID...
-            result != null -> {
-                // ...remove it from the map to clean up and send it to the client.
-                taskResults.remove(taskId)
-                Log.i("TestServer", "Serving result for task $taskId.")
-                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
-            }
-            // If no result is found yet...
-            else -> {
-                // ...tell the client the task is still being processed.
-                Log.i("TestServer", "Result for task $taskId not ready yet.")
-                val pendingJson = gson.toJson(mapOf("taskId" to taskId, "status" to "processing"))
-                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", pendingJson))
-            }
+        return if (resultJson != null) {
+            // 3. Task was found, return its current status (queued, processing, complete, etc.)
+            Log.i("TestServer", "[$taskId] - Serving result: $resultJson")
+            addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", resultJson))
+        } else {
+            // 4. Task ID was not found in the map. This can happen if the client polls
+            //    too quickly after submitting. Return a 404 Not Found.
+            Log.w("TestServer", "[$taskId] - Result requested but not found in map.")
+            addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Task ID not found."))
         }
     }
+
 
 
     private fun generateNewToken(): String {
