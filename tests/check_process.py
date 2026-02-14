@@ -10,7 +10,7 @@ import sys
 import queue
 
 # --- Configuration ---
-PHONE_IP = "192.168.50.124"
+PHONE_IP = "10.109.66.97"
 SERVER_PORT = 8080
 BASE_URL = f"http://{PHONE_IP}:{SERVER_PORT}"
 CLIENT_LOG_FILE = "client_output.log"
