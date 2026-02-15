@@ -70,10 +70,10 @@ class testServer(
     /**
      * Start of timestamp logs to CSV
      */
-    private val csvOutputFile = File(
-        android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOCUMENTS),
-        "recognition_metrics.csv"
-    )
+    // Change this at the class level
+    private val csvOutputFile by lazy {
+        File(context.getExternalFilesDir(null), "recognition_metrics.csv")
+    }
     private val csvLock = Any()
 
     private fun getDetailedTimestamp(): String {
@@ -89,44 +89,16 @@ class testServer(
     ) {
         synchronized(csvLock) {
             try {
-                val resolver = context.contentResolver
-                val fileName = "recognition_metrics.csv"
-
-                // 2. ONLY search for or insert the file if we haven't cached the URI yet
-                if (cachedCsvUri == null) {
-                    val queryUri = MediaStore.Files.getContentUri("external")
-                    val projection = arrayOf(MediaStore.MediaColumns._ID)
-                    val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-                    val selectionArgs = arrayOf(fileName, "%Documents%")
-
-                    resolver.query(queryUri, projection, selection, selectionArgs, null)?.use { cursor ->
-                        if (cursor.moveToFirst()) {
-                            val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID))
-                            cachedCsvUri = android.net.Uri.withAppendedPath(queryUri, id.toString())
-                        }
+                val fileExists = csvOutputFile.exists()
+                // FileWriter with 'true' for append mode
+                FileWriter(csvOutputFile, true).use { writer ->
+                    if (!fileExists) {
+                        writer.append("ID,Request_Received,Recognition_Start,Recognition_End,Response_Sent\n")
                     }
-
-                    // If still null, insert it for the first time
-                    if (cachedCsvUri == null) {
-                        val contentValues = android.content.ContentValues().apply {
-                            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                            put(MediaStore.MediaColumns.MIME_TYPE, "text/csv")
-                            put(MediaStore.MediaColumns.RELATIVE_PATH, android.os.Environment.DIRECTORY_DOCUMENTS)
-                        }
-                        cachedCsvUri = resolver.insert(queryUri, contentValues)
-                    }
-                }
-
-                // 3. Use the cached URI to append
-                cachedCsvUri?.let { fileUri ->
-                    // "wa" mode is critical: it stands for Write-Append
-                    resolver.openOutputStream(fileUri, "wa")?.use { outputStream ->
-                        val row = "$clientId,$received,$start,$end,$sent\n"
-                        outputStream.write(row.toByteArray())
-                    }
+                    writer.append("$clientId,$received,$start,$end,$sent\n")
                 }
             } catch (e: Exception) {
-                Log.e("testServer", "CSV Write Error: ${e.message}")
+                Log.e("testServer", "CSV Write Error to internal external storage: ${e.message}")
             }
         }
     }
