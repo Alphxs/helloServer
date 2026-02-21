@@ -9,28 +9,15 @@ import android.util.Log
 import com.example.android_helloworld.db.UserDao
 import com.google.gson.Gson
 import fi.iki.elonen.NanoHTTPD
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.*
 import java.io.File
+import java.io.FileWriter
 import java.io.IOException
 import java.security.SecureRandom
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
-import java.util.concurrent.Semaphore
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.launch
-import java.sql.Types.NULL
-import com.google.gson.reflect.TypeToken
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeoutOrNull
-import java.util.concurrent.atomic.AtomicInteger
-import java.io.FileWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import android.content.ContentValues
 import android.provider.MediaStore
 import android.net.Uri
@@ -44,19 +31,10 @@ class testServer(
     private val userDao: UserDao,
     port: Int
 ) : NanoHTTPD(port) {
-    // --- NEW: Concurrency Control Variables ---
-    @Volatile // Ensures writes are visible across threads
-    private var maxConcurrentTasks = 2 // Default to 2 concurrent tasks
 
-    // A semaphore to limit the number of active recognition tasks.
-    @Volatile
-    private var recognitionSemaphore = Semaphore(maxConcurrentTasks, true) // `true` for fairness
     private val serverJob = SupervisorJob()
     private val serverScope = CoroutineScope(Dispatchers.IO + serverJob)
 
-    private val activeProcessingTasks = AtomicInteger(0)
-    private val queuedWaitingTasks = AtomicInteger(0)
-    private val taskResults = ConcurrentHashMap<String, String>()
     @Volatile private var cachedBatteryJson: String? = null
     @Volatile private var lastBatteryFetchTime: Long = 0
     private val batteryCacheDurationMs = 1000 // Cache for 1 second
@@ -144,13 +122,8 @@ class testServer(
             method == Method.GET && uri == "/" -> serveHtmlPage()
             method == Method.POST && uri == "/login" -> handleSecureLogin(session)
             method == Method.POST && uri == "/recognize" -> handleSecureRecognition(session)
-            // --- NEW ROUTES ---
-            method == Method.POST && uri == "/set-concurrency" -> handleConcurrencyChange(session)
-            method == Method.GET && uri == "/queue-status" -> handleQueueStatus()
-            // --- END NEW ---
             method == Method.GET && uri == "/battery" -> handleSecureBatteryRequest(session)
             method == Method.GET && uri == "/status" -> handleBatteryRequest()
-            method == Method.GET && uri.startsWith("/result/") -> handleResultRequest(uri)
             method == Method.GET && uri == "/download" -> handleFileDownload(session)
             else -> {
                 Log.w("TestServer", "Unhandled request for URI: $uri")
@@ -198,59 +171,6 @@ class testServer(
         }
     }
 
-    /**
-     * Endpoint to dynamically set the maximum number of concurrent recognition threads.
-     * This is synchronized to prevent race conditions.
-     */
-    private fun handleConcurrencyChange(session: IHTTPSession): Response {
-        // Synchronize to prevent race conditions when changing the semaphore.
-        synchronized(this) {
-            return try {
-                val body = hashMapOf<String, String>()
-                session.parseBody(body)
-                val json = org.json.JSONObject(body["postData"] ?: "{}")
-                val newLimit = json.optInt("maxThreads", -1)
-
-                if (newLimit <= 0) {
-                    return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "'maxThreads' must be a positive integer."))
-                }
-
-                if (newLimit == maxConcurrentTasks) {
-                    return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Concurrency is already set to $newLimit."))
-                }
-
-                Log.w("TestServer", "ADMIN: Changing max concurrency from $maxConcurrentTasks to $newLimit")
-                maxConcurrentTasks = newLimit
-
-                // The new semaphore will immediately apply to the next task waiting to acquire a permit.
-                recognitionSemaphore = Semaphore(newLimit, true)
-
-                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max concurrency successfully set to $newLimit."))
-            } catch (e: Exception) {
-                Log.e("TestServer", "Error setting concurrency", e)
-                addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Failed to parse request."))
-            }
-        }
-    }
-
-
-    /**
-     * Endpoint to report the current status of the recognition queue.
-     */
-    private fun handleQueueStatus(): Response {
-        // This is now the source of truth, no calculation needed.
-        val statusMap = mapOf(
-            "maxConcurrency" to maxConcurrentTasks,
-            "activeProcessingTasks" to activeProcessingTasks.get(),
-            "queuedWaitingTasks" to queuedWaitingTasks.get(),
-        )
-
-        val jsonResponse = gson.toJson(statusMap)
-        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
-    }
-
-
-
     private suspend fun handleSecureRecognition(session: IHTTPSession): Response {
 //        if (!isTokenValid(session)) {
 //            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
@@ -263,6 +183,7 @@ class testServer(
         val requestReceivedTime = getDetailedTimestamp()
         val clientId = session.headers["x-client-request-id"] ?: "unknown"
         val taskId = java.util.UUID.randomUUID().toString()
+        var permanentFile: File? = null
 
         try {
             val files = mutableMapOf<String, String>()
@@ -274,74 +195,33 @@ class testServer(
 
             val tempFile = File(tempImageFilePath)
             val permanentImageDir = File(context.filesDir, "images").apply { mkdirs() }
-            val permanentFile = File(permanentImageDir, "img_${taskId}.jpg")
+            permanentFile = File(permanentImageDir, "img_${taskId}.jpg")
             tempFile.copyTo(permanentFile, overwrite = true)
 
-            taskResults[taskId] = gson.toJson(mapOf("status" to "queued"))
+            val recognitionStartTime = getDetailedTimestamp()
 
-            // Launch processing
-            serverScope.launch(Dispatchers.IO) {
-                processRecognitionTask(taskId, clientId, permanentFile, requestReceivedTime)
-            }
+            // Recognition logic
+            val recognizer = ImageRecognizer(context, userDao)
+            val result = recognizer.processImage(permanentFile)
+            val recognitionEndTime = getDetailedTimestamp()
 
             val responseSentTime = getDetailedTimestamp()
-            val responseJson = gson.toJson(mapOf("taskId" to taskId, "status" to "queued"))
+            logToCsv(clientId, requestReceivedTime, recognitionStartTime, recognitionEndTime, responseSentTime)
 
-            // Recognition start/end will be updated inside processRecognitionTask
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.ACCEPTED, "application/json", responseJson))
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
 
         } catch (e: Exception) {
             Log.e("TestServer", "Error", e)
             return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message))
-        }
-    }
-
-    private suspend fun processRecognitionTask(
-        taskId: String,
-        clientId: String,
-        imageFile: File,
-        receivedTime: String
-    ) {
-        queuedWaitingTasks.incrementAndGet()
-        recognitionSemaphore.acquire()
-
-        val recognitionStartTime = getDetailedTimestamp()
-        try {
-            queuedWaitingTasks.decrementAndGet()
-            activeProcessingTasks.incrementAndGet()
-
-            // Recognition logic
-            val recognizer = ImageRecognizer(context, userDao)
-            val result = recognizer.processImage(imageFile)
-            val recognitionEndTime = getDetailedTimestamp()
-
-            // Prepare data for polling
-            val resultData = mapOf(
-                "status" to "complete",
-                "result" to result,
-                "clientId" to clientId,
-                "receivedTime" to receivedTime,
-                "startTime" to recognitionStartTime,
-                "endTime" to recognitionEndTime
-            )
-            taskResults[taskId] = gson.toJson(resultData)
-
-            logToCsv(clientId, receivedTime, recognitionStartTime, recognitionEndTime, getDetailedTimestamp())
-
-        } catch (e: Exception) {
-            Log.e("TestServer", "Processing error", e)
-            taskResults[taskId] = gson.toJson(mapOf("status" to "error", "message" to e.message))
         } finally {
-            activeProcessingTasks.decrementAndGet()
-            recognitionSemaphore.release()
-
             // --- DELETE THE IMAGE TO AVOID STORAGE OVERLOAD ---
-            if (imageFile.exists()) {
-                imageFile.delete()
+            permanentFile?.let {
+                if (it.exists()) {
+                    it.delete()
+                }
             }
         }
     }
-
 
     private fun handleFileDownload(session: IHTTPSession): Response {
         val params = session.parameters
@@ -425,54 +305,6 @@ class testServer(
 
         return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
     }
-
-
-    /**
-     * Handles polling requests for the result of a specific task.
-     * It extracts the taskId from the URL path.
-     */
-    private fun handleResultRequest(uri: String): Response {
-        val taskId = uri.substringAfterLast('/')
-        if (taskId.isBlank()) {
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Task ID is missing from the URL."))
-        }
-
-        // Peek at the result first without removing it
-        val resultJson = taskResults[taskId]
-            ?: return addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Task not found"))
-
-        val type = object : TypeToken<Map<String, Any>>() {}.type
-        val data: Map<String, Any> = gson.fromJson(resultJson, type)
-
-        // Check if it is complete
-        if (data["status"] == "complete") {
-            // ATOMIC REMOVE: Only the first thread to successfully remove this key
-            // from the ConcurrentHashMap will proceed to log to CSV.
-            val removedJson = taskResults.remove(taskId)
-
-            if (removedJson != null) {
-                // This thread "won" the race and is responsible for logging
-                val actualResponseSentTime = getDetailedTimestamp()
-
-                val clientId = data["clientId"]?.toString() ?: "unknown"
-                val received = data["receivedTime"]?.toString() ?: "N/A"
-                val start = data["startTime"]?.toString() ?: "N/A"
-                val end = data["endTime"]?.toString() ?: "N/A"
-
-                // Log to CSV only once
-                logToCsv(clientId, received, start, end, actualResponseSentTime)
-
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", removedJson))
-            } else {
-                // Another thread already removed and logged this task
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Result already fetched."))
-            }
-        }
-
-        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", resultJson))
-    }
-
-
 
     private fun generateNewToken(): String {
         val random = SecureRandom()
