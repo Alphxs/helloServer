@@ -32,9 +32,8 @@ def set_server_concurrency(num_threads):
     """Sets the max_concurrent_threads on the server via the API."""
     log_message(f"[{get_timestamp()}] [SYSTEM] Setting server concurrency to {num_threads}...")
     try:
-        payload = {"maxThreads": num_threads}
-        # NanoHTTPD parseBody puts post data in 'postData' key
-        response = requests.post(SET_CONCURRENCY_URL, data={"postData": json.dumps(payload)}, timeout=10)
+        params = {"maxThreads": num_threads}
+        response = requests.post(SET_CONCURRENCY_URL, params=params, timeout=10)
         if response.ok:
             log_message(f"[{get_timestamp()}] [SYSTEM] Server updated: {response.text}")
             return True

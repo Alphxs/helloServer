@@ -239,22 +239,10 @@ class testServer(
 
     private fun handleConcurrencyChange(session: IHTTPSession): Response {
         return try {
-            val files = mutableMapOf<String, String>()
-            session.parseBody(files)
+            // Extract the value from query parameters (GET or POST)
+            val maxThreadsParam = session.parameters["maxThreads"]?.firstOrNull()
             
-            // Retrieve the JSON string from form parameters
-            val postData = session.parameters["postData"]?.firstOrNull() ?: "{}"
-            
-            val type = object : com.google.gson.reflect.TypeToken<Map<String, Any>>() {}.type
-            val json: Map<String, Any> = gson.fromJson(postData, type)
-            
-            // Safely extract the number regardless of whether Gson parsed it as Double or Int
-            val maxThreadsRaw = json["maxThreads"]
-            val newLimit = when (maxThreadsRaw) {
-                is Number -> maxThreadsRaw.toInt()
-                is String -> maxThreadsRaw.toIntOrNull() ?: -1
-                else -> -1
-            }
+            val newLimit = maxThreadsParam?.toIntOrNull() ?: -1
 
             if (newLimit > 0) {
                 synchronized(this) {
@@ -263,7 +251,7 @@ class testServer(
                 Log.i("TestServer", "Concurrency limit updated to $newLimit")
                 return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max threads set to $newLimit"))
             } else {
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Invalid maxThreads value: $newLimit"))
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Error: 'maxThreads' parameter must be a positive integer."))
             }
         } catch (e: Exception) {
             Log.e("TestServer", "Error updating concurrency", e)
