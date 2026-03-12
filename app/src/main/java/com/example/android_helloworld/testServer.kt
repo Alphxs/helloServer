@@ -1,5 +1,6 @@
 package com.example.android_helloworld
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -18,6 +19,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 import android.content.ContentValues
 import android.provider.MediaStore
 import android.net.Uri
@@ -41,6 +43,10 @@ class testServer(
 
     private val activeTokens = ConcurrentHashMap.newKeySet<String>()
     private val gson = Gson()
+
+    // --- Concurrency Management ---
+    @Volatile
+    private var max_concurrent_threads = Semaphore(5, true)
 
     @Volatile
     private var cachedCsvUri: android.net.Uri? = null
@@ -122,6 +128,7 @@ class testServer(
             method == Method.GET && uri == "/" -> serveHtmlPage()
             method == Method.POST && uri == "/login" -> handleSecureLogin(session)
             method == Method.POST && uri == "/recognize" -> handleSecureRecognition(session)
+            method == Method.POST && uri == "/set-concurrency" -> handleConcurrencyChange(session)
             method == Method.GET && uri == "/battery" -> handleSecureBatteryRequest(session)
             method == Method.GET && uri == "/status" -> handleBatteryRequest()
             method == Method.GET && uri == "/download" -> handleFileDownload(session)
@@ -198,17 +205,24 @@ class testServer(
             permanentFile = File(permanentImageDir, "img_${taskId}.jpg")
             tempFile.copyTo(permanentFile, overwrite = true)
 
-            val recognitionStartTime = getDetailedTimestamp()
+            // Acquire permit from semaphore to limit concurrent recognition tasks
+            max_concurrent_threads.acquire()
+            try {
+                val recognitionStartTime = getDetailedTimestamp()
 
-            // Recognition logic
-            val recognizer = ImageRecognizer(context, userDao)
-            val result = recognizer.processImage(permanentFile)
-            val recognitionEndTime = getDetailedTimestamp()
+                // Recognition logic
+                val recognizer = ImageRecognizer(context, userDao)
+                val result = recognizer.processImage(permanentFile)
+                val recognitionEndTime = getDetailedTimestamp()
 
-            val responseSentTime = getDetailedTimestamp()
-            logToCsv(clientId, requestReceivedTime, recognitionStartTime, recognitionEndTime, responseSentTime)
+                val responseSentTime = getDetailedTimestamp()
+                logToCsv(clientId, requestReceivedTime, recognitionStartTime, recognitionEndTime, responseSentTime)
 
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
+            } finally {
+                // Always release the permit
+                max_concurrent_threads.release()
+            }
 
         } catch (e: Exception) {
             Log.e("TestServer", "Error", e)
@@ -220,6 +234,40 @@ class testServer(
                     it.delete()
                 }
             }
+        }
+    }
+
+    private fun handleConcurrencyChange(session: IHTTPSession): Response {
+        return try {
+            val files = mutableMapOf<String, String>()
+            session.parseBody(files)
+            
+            // Retrieve the JSON string from form parameters
+            val postData = session.parameters["postData"]?.firstOrNull() ?: "{}"
+            
+            val type = object : com.google.gson.reflect.TypeToken<Map<String, Any>>() {}.type
+            val json: Map<String, Any> = gson.fromJson(postData, type)
+            
+            // Safely extract the number regardless of whether Gson parsed it as Double or Int
+            val maxThreadsRaw = json["maxThreads"]
+            val newLimit = when (maxThreadsRaw) {
+                is Number -> maxThreadsRaw.toInt()
+                is String -> maxThreadsRaw.toIntOrNull() ?: -1
+                else -> -1
+            }
+
+            if (newLimit > 0) {
+                synchronized(this) {
+                    max_concurrent_threads = Semaphore(newLimit, true)
+                }
+                Log.i("TestServer", "Concurrency limit updated to $newLimit")
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max threads set to $newLimit"))
+            } else {
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Invalid maxThreads value: $newLimit"))
+            }
+        } catch (e: Exception) {
+            Log.e("TestServer", "Error updating concurrency", e)
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}"))
         }
     }
 
@@ -302,7 +350,6 @@ class testServer(
         // --- Update the cache ---
         cachedBatteryJson = jsonResponse
         lastBatteryFetchTime = currentTime
-
         return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
     }
 
