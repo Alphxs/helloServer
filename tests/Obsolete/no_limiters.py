@@ -7,7 +7,7 @@ import os
 SERVER_IP = "192.168.50.238"  # !!! IMPORTANT: Replace with your Android device's IP address
 SERVER_URL = f"http://{SERVER_IP}:8080/recognize"
 NUM_REQUESTS = 10  # Number of concurrent requests to send
-IMAGE_FILE = "test_image_1.jpg"
+IMAGE_FILE = "../test_image_1.jpg"
 
 # --- Helper Functions ---
 def get_timestamp():
