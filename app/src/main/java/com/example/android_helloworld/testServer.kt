@@ -238,7 +238,7 @@ class testServer(
     }
 
     private fun handleConcurrencyChange(session: IHTTPSession): Response {
-        return try {
+        try {
             // Extract the value from query parameters (GET or POST)
             val maxThreadsParam = session.parameters["maxThreads"]?.firstOrNull()
             
@@ -332,7 +332,21 @@ class testServer(
             else -> "Not Charging"
         }
 
-        val batteryData = mapOf("level" to "%.1f%%".format(batteryPct), "status" to chargingStatus)
+        // Get mAh using BatteryManager
+        val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        val chargeCounter = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER) // in microampere-hours
+        
+        val mahString = if (chargeCounter != Int.MIN_VALUE) {
+            "%.3f mAh".format(chargeCounter / 1000.0)
+        } else {
+            "Not Supported"
+        }
+
+        val batteryData = mapOf(
+            "level" to "%.1f%%".format(batteryPct),
+            "status" to chargingStatus,
+            "remaining_mah" to mahString
+        )
         val jsonResponse = gson.toJson(batteryData)
 
         // --- Update the cache ---
