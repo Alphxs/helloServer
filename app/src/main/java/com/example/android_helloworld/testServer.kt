@@ -1,6 +1,5 @@
 package com.example.android_helloworld
 
-import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -20,10 +19,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
-import android.content.ContentValues
-import android.provider.MediaStore
-import android.net.Uri
-
 
 // Data class for sending predictions back as JSON
 data class Prediction(val label: String, val score: Float)
@@ -34,9 +29,6 @@ class testServer(
     port: Int
 ) : NanoHTTPD(port) {
 
-    private val serverJob = SupervisorJob()
-    private val serverScope = CoroutineScope(Dispatchers.IO + serverJob)
-
     @Volatile private var cachedBatteryJson: String? = null
     @Volatile private var lastBatteryFetchTime: Long = 0
     private val batteryCacheDurationMs = 1000 // Cache for 1 second
@@ -46,15 +38,11 @@ class testServer(
 
     // --- Concurrency Management ---
     @Volatile
-    private var max_concurrent_threads = Semaphore(5, true)
-
-    @Volatile
-    private var cachedCsvUri: android.net.Uri? = null
+    private var maxConcurrentThreads = Semaphore(5, true)
 
     /**
      * Start of timestamp logs to CSV
      */
-    // Change this at the class level
     private val csvOutputFile by lazy {
         File(context.getExternalFilesDir(null), "recognition_metrics.csv")
     }
@@ -74,7 +62,6 @@ class testServer(
         synchronized(csvLock) {
             try {
                 val fileExists = csvOutputFile.exists()
-                // FileWriter with 'true' for append mode
                 FileWriter(csvOutputFile, true).use { writer ->
                     if (!fileExists) {
                         writer.append("ID,Request_Received,Recognition_Start,Recognition_End,Response_Sent\n")
@@ -82,18 +69,9 @@ class testServer(
                     writer.append("$clientId,$received,$start,$end,$sent\n")
                 }
             } catch (e: Exception) {
-                Log.e("testServer", "CSV Write Error to internal external storage: ${e.message}")
+                Log.e("testServer", "CSV Write Error: ${e.message}")
             }
         }
-    }
-    /**
-     * End of timestamp logs to CSV
-     */
-
-    override fun stop() {
-        super.stop()
-        // Ensure the queue is stopped when the server stops.
-//        RecognitionTaskQueue.stop()
     }
 
     /**
@@ -127,9 +105,9 @@ class testServer(
         return when {
             method == Method.GET && uri == "/" -> serveHtmlPage()
             method == Method.POST && uri == "/login" -> handleSecureLogin(session)
-            method == Method.POST && uri == "/recognize" -> handleSecureRecognition(session)
+            method == Method.POST && uri == "/recognize" -> handleRecognition(session)
             method == Method.POST && uri == "/set-concurrency" -> handleConcurrencyChange(session)
-            method == Method.GET && uri == "/battery" -> handleSecureBatteryRequest(session)
+            method == Method.GET && uri == "/battery" -> handleBatteryRequest()
             method == Method.GET && uri == "/status" -> handleBatteryRequest()
             method == Method.GET && uri == "/download" -> handleFileDownload(session)
             else -> {
@@ -178,13 +156,13 @@ class testServer(
         }
     }
 
-    private suspend fun handleSecureRecognition(session: IHTTPSession): Response {
+//    private suspend fun handleSecureRecognition(session: IHTTPSession): Response {
 //        if (!isTokenValid(session)) {
 //            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
 //        }
 //        Log.i("TestServer", "Token valid, proceeding to queue recognition task.")
-        return handleRecognition(session)
-    }
+//        return handleRecognition(session)
+//    }
 
     private suspend fun handleRecognition(session: IHTTPSession): Response {
         val requestReceivedTime = getDetailedTimestamp()
@@ -205,8 +183,7 @@ class testServer(
             permanentFile = File(permanentImageDir, "img_${taskId}.jpg")
             tempFile.copyTo(permanentFile, overwrite = true)
 
-            // Acquire permit from semaphore to limit concurrent recognition tasks
-            max_concurrent_threads.acquire()
+            maxConcurrentThreads.acquire()
             try {
                 val recognitionStartTime = getDetailedTimestamp()
 
@@ -220,8 +197,7 @@ class testServer(
 
                 return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
             } finally {
-                // Always release the permit
-                max_concurrent_threads.release()
+                maxConcurrentThreads.release()
             }
 
         } catch (e: Exception) {
@@ -239,14 +215,12 @@ class testServer(
 
     private fun handleConcurrencyChange(session: IHTTPSession): Response {
         try {
-            // Extract the value from query parameters (GET or POST)
             val maxThreadsParam = session.parameters["maxThreads"]?.firstOrNull()
-            
             val newLimit = maxThreadsParam?.toIntOrNull() ?: -1
 
             if (newLimit > 0) {
                 synchronized(this) {
-                    max_concurrent_threads = Semaphore(newLimit, true)
+                    maxConcurrentThreads = Semaphore(newLimit, true)
                 }
                 Log.i("TestServer", "Concurrency limit updated to $newLimit")
                 return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max threads set to $newLimit"))
@@ -290,20 +264,18 @@ class testServer(
             response.addHeader("Content-Disposition", "attachment; filename=\"$filename\"")
 
             return addCorsHeaders(response)
-
         } catch (e: IOException) {
-            // This catch block will handle the case where the asset does not exist.
             Log.w("TestServer", "Asset file not found for download: $filename", e)
             return addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: Asset file not found."))
         }
     }
 
-    private fun handleSecureBatteryRequest(session: IHTTPSession): Response {
+//    private fun handleSecureBatteryRequest(session: IHTTPSession): Response {
 //        if (!isTokenValid(session)) {
 //            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
 //        }
-        return handleBatteryRequest()
-    }
+//        return handleBatteryRequest()
+//    }
 
     private fun handleBatteryRequest(): Response {
         val currentTime = System.currentTimeMillis()
@@ -334,7 +306,7 @@ class testServer(
 
         // Get mAh using BatteryManager
         val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-        val chargeCounter = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER) // in microampere-hours
+        val chargeCounter = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
         
         val mahString = if (chargeCounter != Int.MIN_VALUE) {
             "%.3f mAh".format(chargeCounter / 1000.0)
@@ -362,12 +334,12 @@ class testServer(
         return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
 
-    private fun isTokenValid(session: IHTTPSession): Boolean {
-        val authHeader = session.headers["authorization"] ?: return false
-        if (!authHeader.startsWith("Bearer ", ignoreCase = true)) return false
-        val token = authHeader.substringAfter("Bearer ")
-        return activeTokens.contains(token)
-    }
+//    private fun isTokenValid(session: IHTTPSession): Boolean {
+//        val authHeader = session.headers["authorization"] ?: return false
+//        if (!authHeader.startsWith("Bearer ", ignoreCase = true)) return false
+//        val token = authHeader.substringAfter("Bearer ")
+//        return activeTokens.contains(token)
+//    }
 
     private fun addCorsHeaders(response: Response): Response {
         response.addHeader("Access-Control-Allow-Origin", "*")
