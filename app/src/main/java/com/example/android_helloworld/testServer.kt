@@ -1,5 +1,6 @@
 package com.example.android_helloworld
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -38,7 +39,10 @@ class testServer(
 
     // --- Concurrency Management ---
     @Volatile
-    private var maxConcurrentThreads = Semaphore(5, true)
+    private var currentMaxThreads = 5
+    
+    @Volatile
+    private var maxConcurrentThreads = Semaphore(currentMaxThreads, true)
 
     /**
      * Start of timestamp logs to CSV
@@ -78,10 +82,8 @@ class testServer(
      * The main entry point for all HTTP requests.
      */
     override fun serve(session: IHTTPSession): Response {
-        // Use runBlocking on a background thread to safely wait for our suspend functions.
         return runBlocking(Dispatchers.IO) {
             try {
-                // Handle CORS preflight OPTIONS requests first.
                 if (session.method == Method.OPTIONS) {
                     addCorsHeaders(newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, null))
                 } else {
@@ -107,12 +109,12 @@ class testServer(
             method == Method.POST && uri == "/login" -> handleSecureLogin(session)
             method == Method.POST && uri == "/recognize" -> handleRecognition(session)
             method == Method.POST && uri == "/set-concurrency" -> handleConcurrencyChange(session)
-            method == Method.GET && uri == "/battery" -> handleBatteryRequest()
-            method == Method.GET && uri == "/status" -> handleBatteryRequest()
+            method == Method.GET && uri == "/get-max-threads" -> handleGetMaxThreads()
+            method == Method.GET && uri == "/battery" || method == Method.GET && uri == "/status" -> handleBatteryRequest()
             method == Method.GET && uri == "/download" -> handleFileDownload(session)
             else -> {
                 Log.w("TestServer", "Unhandled request for URI: $uri")
-                addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: The requested resource was not found."))
+                addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: Not Found"))
             }
         }
     }
@@ -122,8 +124,7 @@ class testServer(
             val html = context.assets.open("login.html").use { it.bufferedReader().readText() }
             addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/html", html))
         } catch (e: IOException) {
-            Log.e("TestServer", "Could not serve login.html", e)
-            addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Could not load main page."))
+            addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error loading page."))
         }
     }
 
@@ -187,9 +188,11 @@ class testServer(
             try {
                 val recognitionStartTime = getDetailedTimestamp()
 
-                // Recognition logic
-                val recognizer = ImageRecognizer(context, userDao)
-                val result = recognizer.processImage(permanentFile)
+                // Use .use to ensure the recognizer is closed and native memory is freed
+                val result = ImageRecognizer(context, userDao).use { recognizer ->
+                    recognizer.processImage(permanentFile)
+                }
+                
                 val recognitionEndTime = getDetailedTimestamp()
 
                 val responseSentTime = getDetailedTimestamp()
@@ -201,15 +204,10 @@ class testServer(
             }
 
         } catch (e: Exception) {
-            Log.e("TestServer", "Error", e)
+            Log.e("TestServer", "Error during recognition", e)
             return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message))
         } finally {
-            // --- DELETE THE IMAGE TO AVOID STORAGE OVERLOAD ---
-            permanentFile?.let {
-                if (it.exists()) {
-                    it.delete()
-                }
-            }
+            permanentFile?.let { if (it.exists()) it.delete() }
         }
     }
 
@@ -218,34 +216,44 @@ class testServer(
             val maxThreadsParam = session.parameters["maxThreads"]?.firstOrNull()
             val newLimit = maxThreadsParam?.toIntOrNull() ?: -1
 
-            if (newLimit > 0) {
-                synchronized(this) {
-                    maxConcurrentThreads = Semaphore(newLimit, true)
-                }
-                Log.i("TestServer", "Concurrency limit updated to $newLimit")
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max threads set to $newLimit"))
-            } else {
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Error: 'maxThreads' parameter must be a positive integer."))
+            if (newLimit <= 0) {
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Invalid limit"))
             }
+
+            // --- Resource Saturation Guard ---
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val memoryInfo = ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(memoryInfo)
+
+            if (memoryInfo.lowMemory) {
+                Log.w("TestServer", "Rejecting concurrency increase: Memory saturation detected.")
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.TOO_MANY_REQUESTS, "text/plain", "Saturation Reached: System memory low."))
+            }
+
+            synchronized(this) {
+                currentMaxThreads = newLimit
+                maxConcurrentThreads = Semaphore(newLimit, true)
+            }
+
+            Log.i("TestServer", "Concurrency updated to: $newLimit")
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max threads set to $newLimit"))
         } catch (e: Exception) {
-            Log.e("TestServer", "Error updating concurrency", e)
             return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}"))
         }
     }
 
+    private fun handleGetMaxThreads(): Response {
+        Log.i("TestServer", "Returning current max threads: $currentMaxThreads")
+        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", currentMaxThreads.toString()))
+    }
+
     private fun handleFileDownload(session: IHTTPSession): Response {
         val params = session.parameters
-        val filename = params["file"]?.firstOrNull()
-
-        if (filename.isNullOrEmpty()) {
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Error: 'file' parameter is missing."))
-        }
+        val filename = params["file"]?.firstOrNull() ?: return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing filename"))
 
         try {
-            // Prevent directory traversal
             if (filename.contains("/") || filename.contains("\\")) {
-                Log.e("TestServer", "Security Alert: Path characters detected in filename: $filename")
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Error: Invalid filename."))
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Invalid filename"))
             }
 
             // Open an input stream from the assets folder.
@@ -262,35 +270,20 @@ class testServer(
 
             // This header suggests a filename to the browser for the "Save As" dialog.
             response.addHeader("Content-Disposition", "attachment; filename=\"$filename\"")
-
             return addCorsHeaders(response)
         } catch (e: IOException) {
-            Log.w("TestServer", "Asset file not found for download: $filename", e)
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: Asset file not found."))
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "File not found"))
         }
     }
 
-//    private fun handleSecureBatteryRequest(session: IHTTPSession): Response {
-//        if (!isTokenValid(session)) {
-//            return addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Unauthorized: Missing or invalid token."))
-//        }
-//        return handleBatteryRequest()
-//    }
-
     private fun handleBatteryRequest(): Response {
         val currentTime = System.currentTimeMillis()
-
-        // Check if we have a valid, non-stale cache
         if (cachedBatteryJson != null && (currentTime - lastBatteryFetchTime) < batteryCacheDurationMs) {
             Log.i("TestServer", "Serving cached battery status.")
             return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", cachedBatteryJson))
         }
 
-        // --- If cache is stale or empty, fetch new data ---
-        Log.i("TestServer", "Fetching new battery status (cache miss or stale).")
-        val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-        val intent = context.registerReceiver(null, intentFilter)
-
+        val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
         val batteryPct = if (level != -1 && scale != -1) (level / scale.toFloat()) * 100 else -1.0f
@@ -324,7 +317,7 @@ class testServer(
         // --- Update the cache ---
         cachedBatteryJson = jsonResponse
         lastBatteryFetchTime = currentTime
-        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
+        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", cachedBatteryJson))
     }
 
     private fun generateNewToken(): String {
@@ -333,13 +326,6 @@ class testServer(
         random.nextBytes(bytes)
         return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
-
-//    private fun isTokenValid(session: IHTTPSession): Boolean {
-//        val authHeader = session.headers["authorization"] ?: return false
-//        if (!authHeader.startsWith("Bearer ", ignoreCase = true)) return false
-//        val token = authHeader.substringAfter("Bearer ")
-//        return activeTokens.contains(token)
-//    }
 
     private fun addCorsHeaders(response: Response): Response {
         response.addHeader("Access-Control-Allow-Origin", "*")

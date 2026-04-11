@@ -67,4 +67,5 @@ dependencies {
     ksp("androidx.room:room-compiler:$roomVersion")
     implementation("com.google.code.gson:gson:2.10.1") // Or the latest version
     implementation("com.google.mlkit:digital-ink-recognition:19.0.0")
+    implementation(libs.okhttp)
 }
