@@ -112,6 +112,7 @@ class testServer(
             method == Method.GET && uri == "/get-max-threads" -> handleGetMaxThreads()
             method == Method.GET && uri == "/battery" || method == Method.GET && uri == "/status" -> handleBatteryRequest()
             method == Method.GET && uri == "/download" -> handleFileDownload(session)
+            method == Method.GET && uri == "/memory" -> handleMemoryRequest()
             else -> {
                 Log.w("TestServer", "Unhandled request for URI: $uri")
                 addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: Not Found"))
@@ -345,6 +346,42 @@ class testServer(
         cachedBatteryJson = jsonResponse
         lastBatteryFetchTime = currentTime
         return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", cachedBatteryJson))
+    }
+
+    private fun handleMemoryRequest(): Response {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val memoryInfo = ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memoryInfo)
+
+        val runtime = Runtime.getRuntime()
+
+        // Calculate values in MB
+        val totalSystemRam = memoryInfo.totalMem / (1024 * 1024)
+        val availableSystemRam = memoryInfo.availMem / (1024 * 1024)
+        val threshold = memoryInfo.threshold / (1024 * 1024) // Point where system considers itself "Low Memory"
+        val isLowMemory = memoryInfo.lowMemory
+
+        val maxJvmHeap = runtime.maxMemory() / (1024 * 1024)
+        val allocatedJvmHeap = runtime.totalMemory() / (1024 * 1024)
+        val freeJvmHeap = runtime.freeMemory() / (1024 * 1024)
+
+        val jsonResponse = """
+        {
+            "system": {
+                "total_ram_mb": $totalSystemRam,
+                "available_ram_mb": $availableSystemRam,
+                "low_memory_warning": $isLowMemory,
+                "threshold_mb": $threshold
+            },
+            "jvm_heap": {
+                "max_heap_mb": $maxJvmHeap,
+                "allocated_heap_mb": $allocatedJvmHeap,
+                "free_heap_mb": $freeJvmHeap
+            }
+        }
+    """.trimIndent()
+
+        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
     }
 
     private fun generateNewToken(): String {
