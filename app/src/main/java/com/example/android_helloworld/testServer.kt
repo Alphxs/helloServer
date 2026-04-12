@@ -188,17 +188,44 @@ class testServer(
             try {
                 val recognitionStartTime = getDetailedTimestamp()
 
+                // --- Capture System Memory BEFORE ---
+                val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                val memInfo = ActivityManager.MemoryInfo()
+                activityManager.getMemoryInfo(memInfo)
+                val availableBefore = memInfo.availMem / (1024 * 1024)
+
                 // Use .use to ensure the recognizer is closed and native memory is freed
                 val result = ImageRecognizer(context, userDao).use { recognizer ->
                     recognizer.processImage(permanentFile)
                 }
-                
-                val recognitionEndTime = getDetailedTimestamp()
 
+                // --- Capture System Memory AFTER ---
+                activityManager.getMemoryInfo(memInfo)
+                val availableAfter = memInfo.availMem / (1024 * 1024)
+
+                // Calculate actual RAM impact (Native + JVM)
+                val ramConsumed = availableBefore - availableAfter
+                val recognitionEndTime = getDetailedTimestamp()
                 val responseSentTime = getDetailedTimestamp()
+
+                // --- INJECT METRICS INTO JSON ---
+                val resultWithMetrics = result.trim().removeSuffix("}") +
+                        """,
+                "memory_metrics": {
+                    "ram_used_mb": $ramConsumed,
+                    "available_at_start_mb": $availableBefore,
+                    "available_at_end_mb": $availableAfter
+                },
+                "timing_metrics": {
+                    "start": "$recognitionStartTime",
+                    "end": "$recognitionEndTime"
+                }
+                }""".trimIndent()
+
                 logToCsv(clientId, requestReceivedTime, recognitionStartTime, recognitionEndTime, responseSentTime)
 
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", resultWithMetrics))
+
             } finally {
                 maxConcurrentThreads.release()
             }
