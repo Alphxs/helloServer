@@ -20,6 +20,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
+import android.os.Debug
 
 // Data class for sending predictions back as JSON
 data class Prediction(val label: String, val score: Float)
@@ -194,59 +195,43 @@ class testServer(
             try {
                 val recognitionStartTime = getDetailedTimestamp()
 
-                // 1. Get Image size
-                val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                android.graphics.BitmapFactory.decodeFile(permanentFile!!.absolutePath, options)
-                val imageSizeMB = (options.outWidth * options.outHeight * 4) / (1024 * 1024)
+                // Start allocation counting
+                android.os.Debug.startAllocCounting()
 
-                // 2. Get JVM limit
-                val runtime = Runtime.getRuntime()
-                val maxMemory = runtime.maxMemory() / (1024 * 1024)
-                val totalMemory = runtime.totalMemory() / (1024 * 1024)
-                val freeMemory = runtime.freeMemory() / (1024 * 1024)
-                val remainingRoom = ((runtime.maxMemory() - runtime.totalMemory()) + runtime.freeMemory()) / (1024 * 1024)
-
-                // JVM memory BEFORE image recognition
-                val jvmUsedBefore = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
-
-                Log.i("TestServer", "Image: ${imageSizeMB}MB, MAX: ${maxMemory}MB, TOTAL: ${totalMemory}MB, FREE: ${freeMemory}MB, REMAINING: ${remainingRoom}MB")
+                // This should return 0 since we are not doing image recog yet
+                val startAllocatedBytes = android.os.Debug.getThreadAllocSize()
+                Log.i("MEM_TRACK", "Task $taskId | START Allocated RAM: $startAllocatedBytes")
 
                 // Use .use to ensure the recognizer is closed and native memory is freed
                 val result = ImageRecognizer(context, userDao).use { recognizer ->
                     recognizer.processImage(permanentFile)
                 }
 
-                // JVM memory AFTER image recognition
-                val jvmUsedAfter = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
+                // Capture allocated memory AFTER image recognition
+                val endAllocatedBytes = android.os.Debug.getThreadAllocSize() / (1024 * 1024)
+                Log.i("MEM_TRACK", "Task $taskId | END Allocated RAM: $endAllocatedBytes")
 
-                // Calculate the impact
-                val jvmImpact = jvmUsedAfter - jvmUsedBefore
-
-                Log.i("MEM_TRACK", "Task $taskId | JVM Memory Impact: ${jvmImpact}MB")
+                // End allocation counting
+                android.os.Debug.stopAllocCounting()
 
                 val recognitionEndTime = getDetailedTimestamp()
                 val responseSentTime = getDetailedTimestamp()
 
-//                Log.i("IMAGE RECOGNITION MEMORY", "Consumed RAM: $ramConsumed")
-//                Log.i("JVM MEMORY", "Consumed JVM: $jvmImpact")
-//
-//                // --- INJECT METRICS INTO JSON ---
-//                val resultWithMetrics = result.trim().removeSuffix("}") +
-//                        """,
-//                "memory_metrics": {
-//                    "ram_used_mb": $ramConsumed,
-//                    "available_at_start_mb": $availableBefore,
-//                    "available_at_end_mb": $availableAfter
-//                },
-//                "timing_metrics": {
-//                    "start": "$recognitionStartTime",
-//                    "end": "$recognitionEndTime"
-//                }
-//                }""".trimIndent()
+                // --- INJECT METRICS INTO JSON ---
+                val resultWithMetrics = result.trim().removeSuffix("}") +
+                        """,
+                "memory_metrics": {
+                    "ram_used_mb": $endAllocatedBytes
+                },
+                "timing_metrics": {
+                    "start": "$recognitionStartTime",
+                    "end": "$recognitionEndTime"
+                }
+                }""".trimIndent()
 
                 logToCsv(clientId, requestReceivedTime, recognitionStartTime, recognitionEndTime, responseSentTime)
 
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", resultWithMetrics))
 
             } finally {
                 maxConcurrentThreads.release()

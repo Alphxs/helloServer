@@ -11,7 +11,7 @@ SET_CONCURRENCY_URL = f"http://{SERVER_IP}:8080/set-concurrency"
 
 # Stress test settings
 START_THREADS = 1
-END_THREADS = 15
+END_THREADS = 2
 STEP = 1
 REQUESTS_PER_STEP = 20  # Total requests to send for each concurrency level
 
@@ -26,6 +26,7 @@ def log_message(message):
 def create_dummy_image():
     if not os.path.exists(IMAGE_FILE):
         with open(IMAGE_FILE, 'wb') as f:
+            # Create a small valid-ish byte stream
             f.write(b'\x00\x01\x02\x03')
 
 def set_server_concurrency(num_threads):
@@ -45,7 +46,7 @@ def set_server_concurrency(num_threads):
         return False
 
 def send_request(req_id, results):
-    """Sends a single recognition request and records the duration."""
+    """Sends a single recognition request and prints results + memory metrics."""
     start = time.time()
     try:
         with open(IMAGE_FILE, 'rb') as f:
@@ -56,8 +57,32 @@ def send_request(req_id, results):
         duration = time.time() - start
         if response.ok:
             results.append(duration)
+
+            # --- PARSE JSON RESPONSE ---
+            try:
+                data = response.json()
+
+                # 1. Get Recognition Results (Adjust key 'predictions' if different in your JSON)
+                predictions = data.get('predictions', [])
+                labels = [p.get('label', 'unknown') for p in predictions]
+
+                # 2. Get Memory Metrics
+                mem = data.get('memory_metrics', {})
+                jvm_impact = mem.get('jvm_impact_mb', 'N/A')
+                current_heap = mem.get('current_heap_usage_mb', 'N/A')
+
+                log_message(
+                    f"  [Req {req_id}] Results: {labels} | "
+                    f"JVM Impact: {jvm_impact}MB | "
+                    f"Heap: {current_heap}MB | "
+                    f"Time: {duration:.2f}s"
+                )
+            except Exception:
+                # Fallback if JSON parsing fails but request was OK
+                log_message(f"  [Req {req_id}] Success (Raw): {response.text[:50]}...")
+
         else:
-            log_message(f"  Request {req_id} FAILED: {response.status_code}")
+            log_message(f"  Request {req_id} FAILED: {response.status_code} - {response.text}")
     except Exception as e:
         log_message(f"  Request {req_id} ERROR: {e}")
 
@@ -77,18 +102,15 @@ def run_stress_test():
 
         time.sleep(1) # Let server settle
 
-        log_message(f"\n[{get_timestamp()}] Testing with {threads} concurrent threads ({REQUESTS_PER_STEP} requests total)...")
+        log_message(f"\n[{get_timestamp()}] Testing with {threads} concurrent threads...")
 
         durations = []
         client_threads = []
 
-        # We send REQUESTS_PER_STEP requests simultaneously.
-        # Since the server is set to 'threads' concurrency, it will process 'threads' at a time.
         for i in range(threads):
             t = threading.Thread(target=send_request, args=(i, durations))
             client_threads.append(t)
             t.start()
-            # time.sleep(0.01) # Stagger slightly
 
         for t in client_threads:
             t.join()
@@ -96,7 +118,7 @@ def run_stress_test():
         if durations:
             avg = sum(durations) / len(durations)
             success_rate = (len(durations) / threads) * 100
-            print(f"  >> Results for {threads} threads: Avg Duration: {avg:.2f}s | Success Rate: {success_rate:.1f}%")
+            print(f"\n  >> SUMMARY for {threads} threads: Avg: {avg:.2f}s | Success: {success_rate:.1f}%")
             summary.append((threads, avg, success_rate))
         else:
             print(f"  >> Results for {threads} threads: ALL REQUESTS FAILED")
