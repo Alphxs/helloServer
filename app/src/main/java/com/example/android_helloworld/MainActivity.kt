@@ -104,4 +104,19 @@ class MainActivity : ComponentActivity() {
         serviceAnnouncer?.unregisterService()
         Log.i("MainActivity", "Service announcer stopped.")
     }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        when (level) {
+            TRIM_MEMORY_RUNNING_CRITICAL -> {
+                Log.e("MEMORY_MONITOR", "CRITICAL: The system is about to kill this app to reclaim RAM!")
+            }
+            TRIM_MEMORY_RUNNING_LOW -> {
+                Log.w("MEMORY_MONITOR", "WARNING: The system is running low on RAM. Consider reducing concurrency.")
+            }
+            TRIM_MEMORY_RUNNING_MODERATE -> {
+                Log.i("MEMORY_MONITOR", "INFO: System memory is becoming tight.")
+            }
+        }
+    }
 }

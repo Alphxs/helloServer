@@ -5,17 +5,17 @@ import os
 import json
 
 # --- Configuration ---
-SERVER_IP = "172.20.10.9"  # !!! IMPORTANT: Replace with Android device's IP address
+SERVER_IP = "10.215.202.86"  # !!! IMPORTANT: Replace with Android device's IP address
 RECOGNIZE_URL = f"http://{SERVER_IP}:8080/recognize"
 SET_CONCURRENCY_URL = f"http://{SERVER_IP}:8080/set-concurrency"
 
 # Stress test settings
 START_THREADS = 1
-END_THREADS = 10
+END_THREADS = 15
 STEP = 1
 REQUESTS_PER_STEP = 20  # Total requests to send for each concurrency level
 
-IMAGE_FILE = "test_image_1.jpg"
+IMAGE_FILE = "test_image.jpg"
 
 def get_timestamp():
     return time.strftime("%H:%M:%S", time.localtime())
@@ -52,7 +52,7 @@ def send_request(req_id, results):
             files = {'imageFile': (IMAGE_FILE, f, 'image/jpeg')}
             headers = {'x-client-request-id': f'stress-{req_id}'}
             response = requests.post(RECOGNIZE_URL, files=files, headers=headers, timeout=180)
-        
+
         duration = time.time() - start
         if response.ok:
             results.append(duration)
@@ -63,7 +63,7 @@ def send_request(req_id, results):
 
 def run_stress_test():
     create_dummy_image()
-    
+
     print("="*60)
     print(f"Starting Concurrency Stress Test on {SERVER_IP}")
     print(f"Testing from {START_THREADS} to {END_THREADS} threads")
@@ -74,28 +74,28 @@ def run_stress_test():
     for threads in range(START_THREADS, END_THREADS + 1, STEP):
         if not set_server_concurrency(threads):
             break
-        
+
         time.sleep(1) # Let server settle
-        
+
         log_message(f"\n[{get_timestamp()}] Testing with {threads} concurrent threads ({REQUESTS_PER_STEP} requests total)...")
-        
+
         durations = []
         client_threads = []
-        
-        # We send REQUESTS_PER_STEP requests simultaneously. 
+
+        # We send REQUESTS_PER_STEP requests simultaneously.
         # Since the server is set to 'threads' concurrency, it will process 'threads' at a time.
-        for i in range(REQUESTS_PER_STEP):
+        for i in range(threads):
             t = threading.Thread(target=send_request, args=(i, durations))
             client_threads.append(t)
             t.start()
-            time.sleep(0.01) # Stagger slightly
-            
+            # time.sleep(0.01) # Stagger slightly
+
         for t in client_threads:
             t.join()
-            
+
         if durations:
             avg = sum(durations) / len(durations)
-            success_rate = (len(durations) / REQUESTS_PER_STEP) * 100
+            success_rate = (len(durations) / threads) * 100
             print(f"  >> Results for {threads} threads: Avg Duration: {avg:.2f}s | Success Rate: {success_rate:.1f}%")
             summary.append((threads, avg, success_rate))
         else:

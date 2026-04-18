@@ -89,7 +89,12 @@ class testServer(
                 } else {
                     handleRequest(session)
                 }
-            } catch (e: Exception) {
+            } catch (t: Throwable) {
+                // Throwable catches BOTH Exceptions and Errors (like OOM)
+                Log.e("TestServer", "CRASH in serve(): ${t.localizedMessage}")
+                t.printStackTrace() // This prints the full error to Logcat
+                addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Fatal Crash"))
+            }catch (e: Exception) {
                 Log.e("TestServer", "Unhandled error in serve: ${session.uri}", e)
                 addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Server Error: ${e.message}"))
             }
@@ -189,49 +194,68 @@ class testServer(
             try {
                 val recognitionStartTime = getDetailedTimestamp()
 
-                // --- Capture System Memory BEFORE ---
-                val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                val memInfo = ActivityManager.MemoryInfo()
-                activityManager.getMemoryInfo(memInfo)
-                val availableBefore = memInfo.availMem / (1024 * 1024)
+                // 1. Get Image size
+                val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                android.graphics.BitmapFactory.decodeFile(permanentFile!!.absolutePath, options)
+                val imageSizeMB = (options.outWidth * options.outHeight * 4) / (1024 * 1024)
+
+                // 2. Get JVM limit
+                val runtime = Runtime.getRuntime()
+                val maxMemory = runtime.maxMemory() / (1024 * 1024)
+                val totalMemory = runtime.totalMemory() / (1024 * 1024)
+                val freeMemory = runtime.freeMemory() / (1024 * 1024)
+                val remainingRoom = ((runtime.maxMemory() - runtime.totalMemory()) + runtime.freeMemory()) / (1024 * 1024)
+
+                // JVM memory BEFORE image recognition
+                val jvmUsedBefore = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
+
+                Log.i("TestServer", "Image: ${imageSizeMB}MB, MAX: ${maxMemory}MB, TOTAL: ${totalMemory}MB, FREE: ${freeMemory}MB, REMAINING: ${remainingRoom}MB")
 
                 // Use .use to ensure the recognizer is closed and native memory is freed
                 val result = ImageRecognizer(context, userDao).use { recognizer ->
                     recognizer.processImage(permanentFile)
                 }
 
-                // --- Capture System Memory AFTER ---
-                activityManager.getMemoryInfo(memInfo)
-                val availableAfter = memInfo.availMem / (1024 * 1024)
+                // JVM memory AFTER image recognition
+                val jvmUsedAfter = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
 
-                // Calculate actual RAM impact (Native + JVM)
-                val ramConsumed = availableBefore - availableAfter
+                // Calculate the impact
+                val jvmImpact = jvmUsedAfter - jvmUsedBefore
+
+                Log.i("MEM_TRACK", "Task $taskId | JVM Memory Impact: ${jvmImpact}MB")
+
                 val recognitionEndTime = getDetailedTimestamp()
                 val responseSentTime = getDetailedTimestamp()
 
-                // --- INJECT METRICS INTO JSON ---
-                val resultWithMetrics = result.trim().removeSuffix("}") +
-                        """,
-                "memory_metrics": {
-                    "ram_used_mb": $ramConsumed,
-                    "available_at_start_mb": $availableBefore,
-                    "available_at_end_mb": $availableAfter
-                },
-                "timing_metrics": {
-                    "start": "$recognitionStartTime",
-                    "end": "$recognitionEndTime"
-                }
-                }""".trimIndent()
+//                Log.i("IMAGE RECOGNITION MEMORY", "Consumed RAM: $ramConsumed")
+//                Log.i("JVM MEMORY", "Consumed JVM: $jvmImpact")
+//
+//                // --- INJECT METRICS INTO JSON ---
+//                val resultWithMetrics = result.trim().removeSuffix("}") +
+//                        """,
+//                "memory_metrics": {
+//                    "ram_used_mb": $ramConsumed,
+//                    "available_at_start_mb": $availableBefore,
+//                    "available_at_end_mb": $availableAfter
+//                },
+//                "timing_metrics": {
+//                    "start": "$recognitionStartTime",
+//                    "end": "$recognitionEndTime"
+//                }
+//                }""".trimIndent()
 
                 logToCsv(clientId, requestReceivedTime, recognitionStartTime, recognitionEndTime, responseSentTime)
 
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", resultWithMetrics))
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
 
             } finally {
                 maxConcurrentThreads.release()
             }
 
-        } catch (e: Exception) {
+        } catch (oom: OutOfMemoryError) {
+            Log.e("CRASH_LOG", "CRITICAL: Out of Memory during recognition! Client: $clientId")
+            return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Server crashed: Out of Memory"))
+        }catch (e: Exception) {
             Log.e("TestServer", "Error during recognition", e)
             return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message))
         } finally {
