@@ -3,8 +3,10 @@ package com.example.android_helloworld
 
 import android.app.Service
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.annotation.RequiresApi
 import java.io.File
 
 class WatchdogService : Service() {
@@ -62,6 +64,7 @@ class WatchdogService : Service() {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.O)
     private fun restartMainApp() {
         Log.i("WatchdogService", "Restarting ServerService directly.")
         val intent = Intent(applicationContext, ServerService::class.java)
