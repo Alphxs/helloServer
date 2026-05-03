@@ -1,5 +1,9 @@
 package com.example.android_helloworld
 
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -14,25 +18,22 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
 import com.example.android_helloworld.helpers.getIpAddress
+import kotlin.system.exitProcess
 
 class MainActivity : ComponentActivity() {
 
     private var server: testServer? = null
 
-    // Lazily initialize the database instance.
     private val db by lazy {
         Room.databaseBuilder(
             applicationContext,
             AppDatabase::class.java,
             "hello-server-db"
         )
-            // This will delete and recreate the database on schema changes.
-            // It's simple for development but not for production apps with real user data.
             .fallbackToDestructiveMigration()
             .build()
     }
 
-    // Initialize the ViewModel using the factory that provides the Dao.
     private val viewModel: RecognitionViewModel by viewModels {
         RecognitionViewModelFactory(db.userDao())
     }
@@ -41,18 +42,51 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Keep screen awake, for stress testing
+        setupCrashHandler()
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Start the server in a background coroutine.
-        startServer()
+        // Start server as a foreground service instead
+        startForegroundService(Intent(this, ServerService::class.java))
 
-        // Set the content of the activity to be our new history screen.
+        // Start watchdog
+        startService(Intent(this, WatchdogService::class.java))
+
         setContent {
-            // The RecognitionHistoryScreen composable will now be the main UI.
-            // It observes the ViewModel for data changes.
             RecognitionHistoryScreen(viewModel = viewModel)
+        }
+    }
+
+    /**
+     * Sets a global handler to restart the app via AlarmManager when a crash occurs.
+     * This ensures the server stays up even if it hits a fatal error like OOM.
+     */
+    private fun setupCrashHandler() {
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            Log.e("APP_CRASH", "Uncaught exception in thread ${thread.name}: ${throwable.message}", throwable)
+
+            // Prepare intent to restart the main activity
+            val intent = Intent(applicationContext, MainActivity::class.java)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            
+            val pendingIntent = PendingIntent.getActivity(
+                applicationContext, 
+                0, 
+                intent, 
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            // Schedule the restart to happen in 1 second
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            alarmManager.set(AlarmManager.RTC, System.currentTimeMillis() + 1000, pendingIntent)
+
+            // Log and allow the process to terminate so the alarm can trigger the restart
+            if (defaultHandler != null) {
+                defaultHandler.uncaughtException(thread, throwable)
+            } else {
+                exitProcess(2)
+            }
         }
     }
 
@@ -93,16 +127,16 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+    companion object {
+        const val ACTION_SHUTDOWN = "com.example.android_helloworld.ACTION_SHUTDOWN"
+    }
 
     override fun onDestroy() {
         super.onDestroy()
-        // Stop the server when the activity is destroyed to free up the port.
-        CoroutineScope(Dispatchers.IO).launch {
-            server?.stop()
-            Log.i("MainActivity", "Server stopped.")
-        }
+        val stopWatchdog = Intent(this, WatchdogService::class.java)
+        stopWatchdog.action = MainActivity.ACTION_SHUTDOWN
+        startService(stopWatchdog)
         serviceAnnouncer?.unregisterService()
-        Log.i("MainActivity", "Service announcer stopped.")
     }
 
     override fun onTrimMemory(level: Int) {

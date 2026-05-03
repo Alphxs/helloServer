@@ -404,6 +404,5 @@ class testServer(
         response.addHeader("Access-Control-Allow-Origin", "*")
         response.addHeader("Access-Control-Allow-Headers", "origin, x-requested-with, content-type, accept, Authorization")
         response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        return response
-    }
+        return response    }
 }
