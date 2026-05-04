@@ -5,13 +5,13 @@ import os
 import json
 
 # --- Configuration ---
-SERVER_IP = "10.215.202.86"  # !!! IMPORTANT: Replace with Android device's IP address
+SERVER_IP = "192.168.137.95"  # !!! IMPORTANT: Replace with Android device's IP address
 RECOGNIZE_URL = f"http://{SERVER_IP}:8080/recognize"
 SET_CONCURRENCY_URL = f"http://{SERVER_IP}:8080/set-concurrency"
 
 # Stress test settings
 START_THREADS = 1
-END_THREADS = 2
+END_THREADS = 4
 STEP = 1
 REQUESTS_PER_STEP = 20  # Total requests to send for each concurrency level
 
@@ -34,7 +34,7 @@ def set_server_concurrency(num_threads):
     log_message(f"[{get_timestamp()}] [SYSTEM] Setting server concurrency to {num_threads}...")
     try:
         params = {"maxThreads": num_threads}
-        response = requests.post(SET_CONCURRENCY_URL, params=params, timeout=10)
+        response = requests.post(SET_CONCURRENCY_URL, params=params, timeout=None)
         if response.ok:
             log_message(f"[{get_timestamp()}] [SYSTEM] Server updated: {response.text}")
             return True
@@ -52,7 +52,7 @@ def send_request(req_id, results):
         with open(IMAGE_FILE, 'rb') as f:
             files = {'imageFile': (IMAGE_FILE, f, 'image/jpeg')}
             headers = {'x-client-request-id': f'stress-{req_id}'}
-            response = requests.post(RECOGNIZE_URL, files=files, headers=headers, timeout=180)
+            response = requests.post(RECOGNIZE_URL, files=files, headers=headers, timeout=None)
 
         duration = time.time() - start
         if response.ok:

@@ -79,7 +79,7 @@ class MainActivity : ComponentActivity() {
 
                 // Initialize and start the NanoHTTPD server.
                 server = testServer(applicationContext, userDao, 8080)
-                server?.start()
+                server?.start(0, false)
                 Log.i("MainActivity", "Server started successfully on port 8080.")
 
                 serviceAnnouncer = ServiceAnnouncer(applicationContext)

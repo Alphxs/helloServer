@@ -45,23 +45,18 @@ class ImageRecognizer(context: Context, private val userDao: UserDao): Closeable
      * Processes a single image file, runs detection, saves the result, and returns a JSON string.
      * This method is NOT thread-safe and should only be called from a single thread at a time.
      */
-    suspend fun processImage(permanentImageFile: File): String {
-        val options = BitmapFactory.Options().apply {
-            // Read dimensions only (no memory used)
-            inJustDecodeBounds = true
-            BitmapFactory.decodeFile(permanentImageFile.absolutePath, this)
+    suspend fun processImage(
+        permanentImageFile: File,
+    ): String {
+        val bitmap = BitmapFactory.decodeFile(permanentImageFile.absolutePath)
 
-            // Calculate a sample size to ensure the bitmap isn't massive.
-            // A value of 4 means 1/4 width and 1/4 height (1/16th total pixels).
-            inSampleSize = calculateInSampleSize(this, 1024, 1024)
-            inJustDecodeBounds = false
+        if (bitmap == null) {
+            throw IOException("Failed to decode the image file.")
         }
-
-        val bitmap = BitmapFactory.decodeFile(permanentImageFile.absolutePath, options)
-            ?: throw IOException("Failed to decode the image file.")
 
         try {
             val tensorImage = TensorImage.fromBitmap(bitmap)
+
             val results: List<Detection> = objectDetector.detect(tensorImage)
 
             val predictions = results.flatMap { detection ->
@@ -71,8 +66,9 @@ class ImageRecognizer(context: Context, private val userDao: UserDao): Closeable
             }
 
             val jsonResponse = gson.toJson(predictions)
-            val recognizedObjectsStr = predictions.joinToString(", ") { it.label }
+            Log.i("ImageRecognizer", "Detection complete. Found: ${predictions.joinToString { it.label }}")
 
+            val recognizedObjectsStr = predictions.joinToString(", ") { it.label }
             if (recognizedObjectsStr.isNotEmpty()) {
                 val recognitionResult = com.example.android_helloworld.db.RecognitionResult(
                     timestamp = System.currentTimeMillis(),
@@ -83,23 +79,9 @@ class ImageRecognizer(context: Context, private val userDao: UserDao): Closeable
             }
 
             return jsonResponse
+
         } finally {
-            // Manually free the memory immediately
             bitmap.recycle()
         }
-    }
-
-    // Helper to calculate how much to shrink the image
-    private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
-        val (height: Int, width: Int) = options.outHeight to options.outWidth
-        var inSampleSize = 1
-        if (height > reqHeight || width > reqWidth) {
-            val halfHeight = height / 2
-            val halfWidth = width / 2
-            while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
-                inSampleSize *= 2
-            }
-        }
-        return inSampleSize
     }
 }

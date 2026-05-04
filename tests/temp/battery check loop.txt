@@ -1,0 +1,5 @@
+:loop
+curl -s http://192.168.50.4:8080/battery
+echo.
+timeout /t 2 >nul
+goto loop
