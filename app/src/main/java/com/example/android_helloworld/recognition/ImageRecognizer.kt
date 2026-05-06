@@ -1,16 +1,18 @@
-package com.example.android_helloworld
+package com.example.android_helloworld.recognition
 
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.util.Log
+import com.example.android_helloworld.Prediction
+import com.example.android_helloworld.db.RecognitionResult
 import com.example.android_helloworld.db.UserDao
 import com.google.gson.Gson
 import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.task.vision.detector.Detection
 import org.tensorflow.lite.task.vision.detector.ObjectDetector
+import java.io.Closeable
 import java.io.File
 import java.io.IOException
-import java.io.Closeable
 
 /**
  * Encapsulates the logic for image recognition. It loads the model and provides
@@ -70,7 +72,7 @@ class ImageRecognizer(context: Context, private val userDao: UserDao): Closeable
 
             val recognizedObjectsStr = predictions.joinToString(", ") { it.label }
             if (recognizedObjectsStr.isNotEmpty()) {
-                val recognitionResult = com.example.android_helloworld.db.RecognitionResult(
+                val recognitionResult = RecognitionResult(
                     timestamp = System.currentTimeMillis(),
                     imagePath = permanentImageFile.absolutePath,
                     recognizedObjects = recognizedObjectsStr

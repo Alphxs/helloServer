@@ -5,121 +5,40 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
-import android.util.Base64
 import android.util.Log
 import com.example.android_helloworld.db.UserDao
 import com.google.gson.Gson
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.*
 import java.io.File
-import java.io.FileWriter
 import java.io.IOException
-import java.security.SecureRandom
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
-import android.os.Build
-import android.graphics.BitmapFactory
+import com.example.android_helloworld.recognition.ImageRecognizer
 
 // Data class for sending predictions back as JSON
 data class Prediction(val label: String, val score: Float)
 
-class testServer(
-    private val context: Context,
-    private val userDao: UserDao,
-    port: Int
-) : NanoHTTPD(port) {
+class testServer(private val context: Context, private val userDao: UserDao, port: Int) : NanoHTTPD(port) {
     @Volatile private var cachedBatteryJson: String? = null
     @Volatile private var lastBatteryFetchTime: Long = 0
     private val batteryCacheDurationMs = 1000 // Cache for 1 second
-
-    private val activeTokens = ConcurrentHashMap.newKeySet<String>()
     private val gson = Gson()
+    private val logger = MetricsLogger(context)
+    private var baseMaxThreads = 5
+    @Volatile private var currentMaxThreads = 5
+    @Volatile private var maxConcurrentThreads = Semaphore(currentMaxThreads, true)
 
-    // --- Memory Watchdog Variables ---
-    private val MEMORY_THRESHOLD_BYTES = 20L * 1024 * 1024 // 20 MB
-    @Volatile private var isSaturated = false
-    private var baseMaxThreads = 5 // Store the original limit to restore it later
-
-
-    // --- Concurrency Management ---
-    @Volatile
-    private var currentMaxThreads = 5
-    
-    @Volatile
-    private var maxConcurrentThreads = Semaphore(currentMaxThreads, true)
-
-    @Volatile
-    private var isLowMemory = false
-
-    /**
-     * Start of timestamp logs to CSV
-     */
-    private val csvOutputFile by lazy {
-        File(context.getExternalFilesDir(null), "recognition_metrics.csv")
-    }
-    private val csvLock = Any()
-
-    private fun getDetailedTimestamp(): String {
-        return SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
+    private val memoryTracker = MemoryTracker(context) { newLimit ->
+        updateProxyCapacity(if (newLimit == 0) 0 else baseMaxThreads)
     }
 
-    private fun logToCsv(
-        clientId: String,
-        received: String,
-        start: String,
-        end: String,
-        sent: String
-    ) {
-        synchronized(csvLock) {
-            try {
-                val fileExists = csvOutputFile.exists()
-                FileWriter(csvOutputFile, true).use { writer ->
-                    if (!fileExists) {
-                        writer.append("ID,Request_Received,Recognition_Start,Recognition_End,Response_Sent\n")
-                    }
-                    writer.append("$clientId,$received,$start,$end,$sent\n")
-                }
-            } catch (e: Exception) {
-                Log.e("testServer", "CSV Write Error: ${e.message}")
-            }
+    private fun updateProxyCapacity(newLimit: Int) {
+        synchronized(this) {
+            currentMaxThreads = newLimit
+            maxConcurrentThreads = Semaphore(if (newLimit == 0) 1 else newLimit, true)
+            if (newLimit == 0) maxConcurrentThreads.acquireUninterruptibly(1)
         }
     }
-
-    // Step 1: START of Memory Limit Tracker
-    private val isOldAndroid = Build.VERSION.SDK_INT <= Build.VERSION_CODES.N_MR1 // Android 7.1 or lower
-    private val jvmMaxLimit: Long
-    private var availableJavaMemAtStartup: Long = 0
-
-    // Thread-safe tracker for "reserved" memory by active tasks
-    @Volatile private var currentReservedJavaMem: Long = 0
-    private val memoryLock = Any()
-
-    // Gets available Java heap memory at startup
-    // Reason why at startup: when methods are invoked after the first image recog, memory aren't deallocated.
-    // Hence, they show it as if it is occupied when in reality it is free to use.
-    init {
-        val runtime = Runtime.getRuntime()
-        val maxJvm = runtime.maxMemory()
-        val allocatedJvm = runtime.totalMemory()
-        val freeJvm = runtime.freeMemory()
-
-        // Formula: availableJavaMem = (maxJvmHeap - allocatedJvmHeap) + freeJvmHeap
-        availableJavaMemAtStartup = (maxJvm - allocatedJvm) + freeJvm
-        jvmMaxLimit = maxJvm
-
-        Log.i("AdmissionControl", "Startup - OS: ${Build.VERSION.RELEASE}, Avail JVM: ${availableJavaMemAtStartup / 1024 / 1024}MB")
-
-        CoroutineScope(Dispatchers.Default).launch {
-            while (isActive) {
-                monitorAndSignalProxy()
-                delay(500) // Poll every 500ms for high responsiveness
-            }
-        }
-    }
-    // Step 1: START of Memory Limit Tracker
 
 
     /**
@@ -154,15 +73,12 @@ class testServer(
         Log.i("TestServer", "Handling: $method $uri")
 
         return when {
-            method == Method.GET && uri == "/" -> serveHtmlPage()
-            method == Method.POST && uri == "/login" -> handleSecureLogin(session)
             method == Method.POST && uri == "/recognize" -> handleRecognition(session)
             method == Method.POST && uri == "/set-concurrency" -> handleConcurrencyChange(session)
             method == Method.GET && uri == "/get-max-threads" -> handleGetMaxThreads()
             method == Method.GET && uri == "/battery" || method == Method.GET && uri == "/status" -> handleBatteryRequest()
             method == Method.GET && uri == "/download" -> handleFileDownload(session)
             method == Method.GET && uri == "/memory" -> handleMemoryRequest()
-            method == Method.GET && uri == "/is-low-memory" -> handleLowMemoryStatus()
             else -> {
                 Log.w("TestServer", "Unhandled request for URI: $uri")
                 addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: Not Found"))
@@ -170,46 +86,8 @@ class testServer(
         }
     }
 
-    private fun serveHtmlPage(): Response {
-        return try {
-            val html = context.assets.open("login.html").use { it.bufferedReader().readText() }
-            addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/html", html))
-        } catch (e: IOException) {
-            addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error loading page."))
-        }
-    }
-
-    private suspend fun handleSecureLogin(session: IHTTPSession): Response {
-        return try {
-            val files = mutableMapOf<String, String>()
-            session.parseBody(files)
-            val params = session.parameters
-            val username = params["username"]?.firstOrNull()
-            val password = params["password"]?.firstOrNull()
-
-            if (username.isNullOrEmpty() || password.isNullOrEmpty()) {
-                addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Username and password are required."))
-            } else {
-                val user = userDao.findByUsername(username)
-                if (user != null && password == user.passwordHash) {
-                    val token = generateNewToken()
-                    activeTokens.add(token)
-                    Log.i("TestServer", "Login successful for '$username'. Issued token.")
-                    val jsonResponse = "{\"token\": \"$token\"}"
-                    addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
-                } else {
-                    Log.w("TestServer", "Login failed for user '$username'.")
-                    addCorsHeaders(newFixedLengthResponse(Response.Status.UNAUTHORIZED, "text/plain", "Invalid username or password."))
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("TestServer", "Error during login", e)
-            addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "An internal error occurred during login."))
-        }
-    }
-
     private suspend fun handleRecognition(session: IHTTPSession): Response {
-        val requestReceivedTime = getDetailedTimestamp()
+        val receivedTime = logger.getDetailedTimestamp()
         val clientId = session.headers["x-client-request-id"] ?: "unknown"
         val taskId = java.util.UUID.randomUUID().toString()
         var permanentFile: File? = null
@@ -227,63 +105,28 @@ class testServer(
             permanentFile = File(permanentImageDir, "img_${taskId}.jpg")
             tempFile.copyTo(permanentFile, overwrite = true)
 
-            // --- Step 2: Compute Allocated Memory Prediction ---
-            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeFile(permanentFile.absolutePath, options)
-            val w = options.outWidth.toLong()
-            val h = options.outHeight.toLong()
+            // --- Compute Allocated Memory for Java heap and Native mem ---
+            val (allocJavaMem, allocNativeMem) = memoryTracker.predictMemory(permanentFile.absolutePath)
 
-            val (allocJavaMem, allocNativeMem) = calculatePredictedMemory(w, h)
-
-            // --- Step 3 & 4: Admission Control ---
-            val isAdmissible = synchronized(memoryLock) {
-                val availableNative = getAvailableNativeMem()
-                val currentActualJavaRoom = availableJavaMemAtStartup - currentReservedJavaMem
-
-                val javaFit = allocJavaMem <= currentActualJavaRoom
-                val nativeFit = allocNativeMem <= availableNative
-
-                if (javaFit && nativeFit) {
-                    // Step 4: Continue - Increment reserved memory
-                    currentReservedJavaMem += allocJavaMem
-                    true
-                } else {
-                    Log.w("AdmissionControl", "REJECTED - JavaFit: $javaFit, NativeFit: $nativeFit")
-                    false
-                }
-            }
-
-            if (!isAdmissible) {
+            if (!memoryTracker.tryReserve(allocJavaMem, allocNativeMem)) {
                 return addCorsHeaders(newFixedLengthResponse(Response.Status.TOO_MANY_REQUESTS, "text/plain", "Insufficient Memory"))
             }
 
-            maxConcurrentThreads.acquire()
-            try {
-                val recognitionStartTime = getDetailedTimestamp()
+            return try {
+                maxConcurrentThreads.acquire()
+                val startTime = logger.getDetailedTimestamp()
+                val result = ImageRecognizer(context, userDao).use { it.processImage(permanentFile) }
+                val endTime = logger.getDetailedTimestamp()
 
-                // Use .use to ensure the recognizer is closed and native memory is freed
-                val result = ImageRecognizer(context, userDao).use { recognizer ->
-                    recognizer.processImage(permanentFile)
-                }
-
-                val recognitionEndTime = getDetailedTimestamp()
-                val responseSentTime = getDetailedTimestamp()
-
-                logToCsv(clientId, requestReceivedTime, recognitionStartTime, recognitionEndTime, responseSentTime)
-
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
+                logger.logToCsv(clientId, receivedTime, startTime, endTime, logger.getDetailedTimestamp())
+                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
             } finally {
-                // Step 5: Done - Decrement reserved memory
-                synchronized(memoryLock) {
-                    currentReservedJavaMem -= allocJavaMem
-                }
+                memoryTracker.release(allocJavaMem) // Subtract the allocated memory from the playgroundMem
                 maxConcurrentThreads.release()
+                if (permanentFile.exists()) permanentFile.delete()
             }
         } catch (oom: OutOfMemoryError) {
             val causeDetails = oom.cause?.toString() ?: oom.message ?: "No specific cause details available"
-
-            Log.e("CRASH_LOG", "CRITICAL: Out of Memory during recognition! Client: $clientId. Cause: $causeDetails", oom)
-
             return addCorsHeaders(newFixedLengthResponse(
                 Response.Status.INTERNAL_ERROR,
                 "text/plain",
@@ -406,79 +249,6 @@ class testServer(
         return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", cachedBatteryJson))
     }
 
-    // Monitors currentJavaRoom.
-    // If it reached the threshold, set maxConcurrentThreads to 0
-    // Else if it is okay again (below threshold), set maxConcurrentThreads to its original value 5
-    private fun monitorAndSignalProxy() {
-        val currentJavaRoom = availableJavaMemAtStartup - currentReservedJavaMem
-        val currentNativeRoom = getAvailableNativeMem()
-
-        // 1. Threshold Check (20MB)
-        // Stop if EITHER is <= 20MB
-        val needsStop = currentJavaRoom <= MEMORY_THRESHOLD_BYTES || currentNativeRoom <= MEMORY_THRESHOLD_BYTES
-
-        // 2. Recovery Check
-        // Okay again only if BOTH are > 20MB
-        val canResume = currentJavaRoom > MEMORY_THRESHOLD_BYTES && currentNativeRoom > MEMORY_THRESHOLD_BYTES
-
-        if (needsStop && !isSaturated) {
-            // TRANSITION TO STOP
-            isSaturated = true
-            Log.e("Watchdog", "!!! CRITICAL MEMORY !!! Java: ${currentJavaRoom/1024/1024}MB, Native: ${currentNativeRoom/1024/1024}MB")
-            updateProxyCapacity(0)
-        }
-        else if (canResume && isSaturated) {
-            // TRANSITION TO START
-            isSaturated = false
-            Log.i("Watchdog", "Memory Recovered. Restoring capacity to $baseMaxThreads")
-            updateProxyCapacity(baseMaxThreads)
-        }
-    }
-
-    // Updates the current max concurrent threads when threshold is reached
-    private fun updateProxyCapacity(newLimit: Int) {
-        synchronized(this) {
-            currentMaxThreads = newLimit
-            // We re-initialize the semaphore to block/unblock incoming requests
-            maxConcurrentThreads = Semaphore(if (newLimit == 0) 1 else newLimit, true)
-            if (newLimit == 0) {
-                // Drain the semaphore if we are stopping
-                maxConcurrentThreads.acquireUninterruptibly(1)
-            }
-        }
-        // By setting this to 0, the Proxy's routing algorithm will see 0 capacity and skip this edge.
-        Log.i("ProxySignal", "SIGNAL: MaxLimit updated to $newLimit")
-    }
-
-    // IMPORTANT: Formula for computing the allocated memory of a single image
-    private fun calculatePredictedMemory(w: Long, h: Long): Pair<Long, Long> {
-        val arena = 3.9 * 1024 * 1024
-        var javaMem: Long = 0
-        var nativeMem: Long = 0
-
-        if (isOldAndroid) { // Android 7.1 and lower
-            // Java: decode(w*h*4) + detect(w*h*4 + w*h*3)
-            javaMem = (w * h * 4) + (w * h * 4) + (w * h * 3)
-            // Native: detectNative(w*h*4 + arena) + decode(w*h*3)
-            nativeMem = (w * h * 4 + arena.toLong()) + (w * h * 3)
-        } else { // Android 8.0+ Higher versions
-            // Java: detect(w*h*4 + w*h*3)
-            javaMem = (w * h * 4) + (w * h * 3)
-            // Native: detectNative(w*h*4 + arena) + decode((w*h*4) + (w*h*3))
-            nativeMem = ((w * h * 4) + arena.toLong()) + (w * h * 4) + (w * h * 3)
-        }
-        return Pair(javaMem, nativeMem)
-    }
-
-    // Helper function to retrieve current available system RAM
-    private fun getAvailableNativeMem(): Long {
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val memInfo = ActivityManager.MemoryInfo()
-        activityManager.getMemoryInfo(memInfo)
-        // availableNativeMem = system.AvailMem() - system.Threshold()
-        return memInfo.availMem - memInfo.threshold
-    }
-
     // Not used in the actual implementation, just for testing purposes
     private fun handleMemoryRequest(): Response {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -488,10 +258,10 @@ class testServer(
         val runtime = Runtime.getRuntime()
 
         // 1. JVM Heap Stats (Standard)
-        val maxHeapMb = runtime.maxMemory() / (1024 * 1024)
-        val allocatedHeapMb = runtime.totalMemory() / (1024 * 1024)
-        val freeInAllocatedMb = runtime.freeMemory() / (1024 * 1024)
-        val actualUsedHeapMb = allocatedHeapMb - freeInAllocatedMb
+        val maxHeapMb = runtime.maxMemory() // (1024 * 1024)
+        val totalHeapMb = runtime.totalMemory() // (1024 * 1024)
+        val freeInTotalMb = runtime.freeMemory() // (1024 * 1024)
+        val actualUsedHeapMb = totalHeapMb - freeInTotalMb
 
         // 2. Process-wide Native Stats (Critical for TFLite/Bitmaps)
         val debugMemInfo = android.os.Debug.MemoryInfo()
@@ -523,8 +293,8 @@ class testServer(
 
         val memoryData = mapOf(
             "jvm_heap" to mapOf(
-                "used_mb" to actualUsedHeapMb,
-                "allocated_mb" to allocatedHeapMb,
+                "free_mb" to freeInTotalMb,
+                "total_mb" to totalHeapMb,
                 "max_limit_mb" to maxHeapMb
             ),
             "pss_mem" to mapOf(
@@ -553,33 +323,6 @@ class testServer(
 
         val jsonResponse = gson.toJson(memoryData)
         return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
-    }
-
-    // Not used in the actual implementation, just for testing purposes
-    private fun handleLowMemoryStatus(): Response {
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val isLowRamDevice = activityManager.isLowRamDevice
-
-        val currentJava = (availableJavaMemAtStartup - currentReservedJavaMem) / (1024 * 1024)
-        val currentNative = getAvailableNativeMem() / (1024 * 1024)
-
-        val jsonResponse = """
-            {
-                "isLowMemoryAdvisory": $isSaturated,
-                "isLowRamDevice": $isLowRamDevice,
-                "availableJavaMb": $currentJava,
-                "availableNativeMb": $currentNative,
-                "currentMaxThreads": $currentMaxThreads
-            }
-        """.trimIndent()
-        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", jsonResponse))
-    }
-
-    private fun generateNewToken(): String {
-        val random = SecureRandom()
-        val bytes = ByteArray(24)
-        random.nextBytes(bytes)
-        return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
 
     private fun addCorsHeaders(response: Response): Response {

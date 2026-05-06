@@ -1,4 +1,4 @@
-package com.example.android_helloworld
+package com.example.android_helloworld.service_announcer
 
 import android.content.Context
 import android.net.nsd.NsdManager

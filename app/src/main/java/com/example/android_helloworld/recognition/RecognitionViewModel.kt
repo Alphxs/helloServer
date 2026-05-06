@@ -1,4 +1,4 @@
-package com.example.android_helloworld
+package com.example.android_helloworld.recognition
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -6,9 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.android_helloworld.db.RecognitionResult
 import com.example.android_helloworld.db.UserDao
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 // ViewModel to hold and manage UI-related data.

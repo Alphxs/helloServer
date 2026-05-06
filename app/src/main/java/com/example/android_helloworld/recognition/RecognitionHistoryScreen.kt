@@ -1,4 +1,4 @@
-package com.example.android_helloworld
+package com.example.android_helloworld.recognition
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*

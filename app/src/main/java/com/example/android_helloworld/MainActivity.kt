@@ -14,6 +14,10 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
 import com.example.android_helloworld.helpers.getIpAddress
+import com.example.android_helloworld.recognition.RecognitionHistoryScreen
+import com.example.android_helloworld.recognition.RecognitionViewModel
+import com.example.android_helloworld.recognition.RecognitionViewModelFactory
+import com.example.android_helloworld.service_announcer.ServiceAnnouncer
 
 class MainActivity : ComponentActivity() {
 
