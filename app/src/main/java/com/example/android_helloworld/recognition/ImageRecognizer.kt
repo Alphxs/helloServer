@@ -3,6 +3,7 @@ package com.example.android_helloworld.recognition
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.util.Log
+import com.example.android_helloworld.ProxyNotifier
 import com.example.android_helloworld.Prediction
 import com.example.android_helloworld.db.RecognitionResult
 import com.example.android_helloworld.db.UserDao
@@ -19,7 +20,7 @@ import java.io.IOException
  * a method to perform detection on an image file. This class is NOT thread-safe
  * on its own and should be used by a queuing mechanism like RecognitionTaskQueue.
  */
-class ImageRecognizer(context: Context, private val userDao: UserDao): Closeable {
+class ImageRecognizer(context: Context, private val userDao: UserDao, private val proxyNotifier: ProxyNotifier): Closeable {
 
     private val gson = Gson()
     private val objectDetector: ObjectDetector
@@ -51,6 +52,7 @@ class ImageRecognizer(context: Context, private val userDao: UserDao): Closeable
         permanentImageFile: File,
     ): String {
         val bitmap = BitmapFactory.decodeFile(permanentImageFile.absolutePath)
+        proxyNotifier.checkAndNotifyHeapThreshold() // Check threshold after bitmap is allocated
 
         if (bitmap == null) {
             throw IOException("Failed to decode the image file.")
@@ -58,8 +60,10 @@ class ImageRecognizer(context: Context, private val userDao: UserDao): Closeable
 
         try {
             val tensorImage = TensorImage.fromBitmap(bitmap)
+            proxyNotifier.checkAndNotifyHeapThreshold() // Check threshold after TensorImage is created
 
             val results: List<Detection> = objectDetector.detect(tensorImage)
+            proxyNotifier.checkAndNotifyHeapThreshold() // Check threshold after detection
 
             val predictions = results.flatMap { detection ->
                 detection.categories.map { category ->

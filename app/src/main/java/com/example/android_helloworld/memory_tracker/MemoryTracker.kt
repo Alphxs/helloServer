@@ -4,33 +4,23 @@ import android.app.ActivityManager
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.os.Build
-import android.util.Log
-import kotlinx.coroutines.*
 import java.util.concurrent.atomic.AtomicLong
 
-class MemoryTracker(private val context: Context, private val onSaturationChanged: (Int) -> Unit) {
-    private val MEMORY_THRESHOLD_BYTES = 20L * 1024 * 1024
+class MemoryTracker(private val context: Context) {
     private val isOldAndroid = Build.VERSION.SDK_INT <= Build.VERSION_CODES.N_MR1
 
     private var playgroundMem: Long = 0
     private val currentReservedJavaMem = AtomicLong(0)
 
-    @Volatile var isSaturated = false
-        private set
-
     init {
         val runtime = Runtime.getRuntime()
+        // playgroundMem is the absolute ceiling of the JVM minus currently occupied space
         playgroundMem = runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())
-
-        CoroutineScope(Dispatchers.Default).launch {
-            while (isActive) {
-                checkMemoryPressure()
-                delay(500)
-            }
-        }
     }
 
-    // Helper function to retrieve current available system RAM
+    /**
+     * Retrieves current available system RAM minus the LMK threshold.
+     */
     fun getAvailableNativeMem(): Long {
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val mi = ActivityManager.MemoryInfo()
@@ -38,30 +28,15 @@ class MemoryTracker(private val context: Context, private val onSaturationChange
         return mi.availMem - mi.threshold
     }
 
+    /**
+     * Returns the remaining capacity in the Java Heap (Playground Memory).
+     */
     fun getRemainingJavaRoom() = playgroundMem - currentReservedJavaMem.get()
 
-    // Monitors currentJavaRoom.
-    // If it reached the threshold, set maxConcurrentThreads to 0
-    // Else if it is okay again (below threshold), set maxConcurrentThreads to its original value 5
-    private fun checkMemoryPressure() {
-        val javaRoom = getRemainingJavaRoom()
-        val nativeRoom = getAvailableNativeMem()
-
-        val needsStop = javaRoom <= MEMORY_THRESHOLD_BYTES || nativeRoom <= MEMORY_THRESHOLD_BYTES
-        val canResume = javaRoom > MEMORY_THRESHOLD_BYTES && nativeRoom > MEMORY_THRESHOLD_BYTES
-
-        if (needsStop && !isSaturated) {
-            isSaturated = true
-            onSaturationChanged(0)
-        } else if (canResume && isSaturated) {
-            isSaturated = false
-            onSaturationChanged(-1) // Signal to restore base limit
-        }
-    }
-
-    // IMPORTANT: Formula for computing the allocated memory of a single image
-
-    fun predictMemory(path: String): Pair<Long, Long> {
+    /**
+     * Calculates the memory impact based on RTTms formulas for different Android versions.
+     */
+    fun calculateMemory(path: String): Pair<Long, Long> {
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(path, options)
         val w = options.outWidth.toLong()
@@ -69,26 +44,38 @@ class MemoryTracker(private val context: Context, private val onSaturationChange
         val arena = 3.9 * 1024 * 1024
 
         return if (isOldAndroid) {
-            // Java: decode(w*h*4) + detect(w*h*4 + w*h*3)
+            // Android 7.1 and lower
             val java = (w * h * 4) + (w * h * 4) + (w * h * 3)
-            // Native: detectNative(w*h*4 + arena) + decode(w*h*3)
             val native = (w * h * 4 + arena.toLong()) + (w * h * 3)
-            Pair(java, native) // Logic as per your 7.1 requirement
+            Pair(java, native)
         } else {
-            // Java: detect(w*h*4 + w*h*3)
+            // Android 8.0+
             val java = (w * h * 4) + (w * h * 3)
-            // Native: detectNative(w*h*4 + arena) + decode((w*h*4) + (w*h*3))
             val native = ((w * h * 4) + arena.toLong()) + (w * h * 4) + (w * h * 3)
             Pair(java, native)
         }
     }
 
+    /**
+     * Performs a non-blocking check to see if an image fits.
+     * Used to trigger the 'BUSY' status notification.
+     */
+    fun canFit(javaMem: Long, nativeMem: Long): Boolean {
+        return javaMem <= getRemainingJavaRoom() && nativeMem <= getAvailableNativeMem()
+    }
+
+    /**
+     * Atomically reserves memory if it fits.
+     */
     fun tryReserve(javaMem: Long, nativeMem: Long): Boolean {
         if (javaMem > getRemainingJavaRoom() || nativeMem > getAvailableNativeMem()) return false
         currentReservedJavaMem.addAndGet(javaMem)
         return true
     }
 
+    /**
+     * Releases the reserved Java memory once the recognition is done.
+     */
     fun release(javaMem: Long) {
         currentReservedJavaMem.addAndGet(-javaMem)
     }

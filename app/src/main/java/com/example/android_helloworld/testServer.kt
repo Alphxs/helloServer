@@ -14,6 +14,10 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.Semaphore
 import com.example.android_helloworld.recognition.ImageRecognizer
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 // Data class for sending predictions back as JSON
 data class Prediction(val label: String, val score: Float)
@@ -23,23 +27,17 @@ class testServer(private val context: Context, private val userDao: UserDao, por
     @Volatile private var lastBatteryFetchTime: Long = 0
     private val batteryCacheDurationMs = 1000 // Cache for 1 second
     private val gson = Gson()
+    private val memoryLock = Mutex()
     private val logger = MetricsLogger(context)
-    private var baseMaxThreads = 5
-    @Volatile private var currentMaxThreads = 5
-    @Volatile private var maxConcurrentThreads = Semaphore(currentMaxThreads, true)
 
-    private val memoryTracker = MemoryTracker(context) { newLimit ->
-        updateProxyCapacity(if (newLimit == 0) 0 else baseMaxThreads)
-    }
+    private val memoryTracker = MemoryTracker(context)
+    private val proxyNotifier = ProxyNotifier(context, "http://YOUR_PROXY_IP:PORT/status")
 
-    private fun updateProxyCapacity(newLimit: Int) {
-        synchronized(this) {
-            currentMaxThreads = newLimit
-            maxConcurrentThreads = Semaphore(if (newLimit == 0) 1 else newLimit, true)
-            if (newLimit == 0) maxConcurrentThreads.acquireUninterruptibly(1)
-        }
-    }
+    // Broadcast signal: Wakes up ALL waiting coroutines
+    private val memorySignal = MutableSharedFlow<Unit>(replay = 0)
 
+    // Tracks how many requests are currently in the "Waiting Room"
+    private val waitingThreadsCount = java.util.concurrent.atomic.AtomicInteger(0)
 
     /**
      * The main entry point for all HTTP requests.
@@ -74,8 +72,8 @@ class testServer(private val context: Context, private val userDao: UserDao, por
 
         return when {
             method == Method.POST && uri == "/recognize" -> handleRecognition(session)
-            method == Method.POST && uri == "/set-concurrency" -> handleConcurrencyChange(session)
-            method == Method.GET && uri == "/get-max-threads" -> handleGetMaxThreads()
+//            method == Method.POST && uri == "/set-concurrency" -> handleConcurrencyChange(session)
+//            method == Method.GET && uri == "/get-max-threads" -> handleGetMaxThreads()
             method == Method.GET && uri == "/battery" || method == Method.GET && uri == "/status" -> handleBatteryRequest()
             method == Method.GET && uri == "/download" -> handleFileDownload(session)
             method == Method.GET && uri == "/memory" -> handleMemoryRequest()
@@ -105,24 +103,59 @@ class testServer(private val context: Context, private val userDao: UserDao, por
             permanentFile = File(permanentImageDir, "img_${taskId}.jpg")
             tempFile.copyTo(permanentFile, overwrite = true)
 
-            // --- Compute Allocated Memory for Java heap and Native mem ---
-            val (allocJavaMem, allocNativeMem) = memoryTracker.predictMemory(permanentFile.absolutePath)
+            // Compute Allocated Memory for Java heap and Native mem
+            val (allocJavaMem, allocNativeMem) = memoryTracker.calculateMemory(permanentFile.absolutePath)
 
-            if (!memoryTracker.tryReserve(allocJavaMem, allocNativeMem)) {
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.TOO_MANY_REQUESTS, "text/plain", "Insufficient Memory"))
+            var waitStartTime = System.currentTimeMillis()
+            var isAdmitted = false
+
+            // Notify Proxy immediately if we are already saturated before waiting
+            if (!memoryTracker.canFit(allocJavaMem, allocNativeMem)) {
+                proxyNotifier.sendStatusUpdate(isAvailable = false, reason = "MEM_SATURATED_QUEUING")
             }
 
-            return try {
-                maxConcurrentThreads.acquire()
-                val startTime = logger.getDetailedTimestamp()
-                val result = ImageRecognizer(context, userDao).use { it.processImage(permanentFile) }
-                val endTime = logger.getDetailedTimestamp()
+            // Wait for memory to be available
+            waitingThreadsCount.incrementAndGet()
+            try {
+                while (!isAdmitted) {
+                    memoryLock.withLock {
+                        if (memoryTracker.tryReserve(allocJavaMem, allocNativeMem)) {
+                            isAdmitted = true
+                        }
+                    }
 
-                logger.logToCsv(clientId, receivedTime, startTime, endTime, logger.getDetailedTimestamp())
+                    if (!isAdmitted) {
+                        // SUSPEND here. When memorySignal.emit() is called later,
+                        // ALL waiting threads wake up and loop back to tryReserve.
+                        memorySignal.first()
+                    }
+                }
+            } finally {
+                waitingThreadsCount.decrementAndGet()
+            }
+
+            val waitDurationMs = System.currentTimeMillis() - waitStartTime
+
+            return try {
+                val recognitionStartTime = logger.getDetailedTimestamp()
+
+                val result = ImageRecognizer(context, userDao, proxyNotifier).use { it.processImage(permanentFile) }
+
+                val recognitionEndTime = logger.getDetailedTimestamp()
+
+                logger.logToCsv(clientId, receivedTime, recognitionStartTime, recognitionEndTime, logger.getDetailedTimestamp(), waitDurationMs.toString())
                 addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
             } finally {
-                memoryTracker.release(allocJavaMem) // Subtract the allocated memory from the playgroundMem
-                maxConcurrentThreads.release()
+                memoryLock.withLock {
+                    // Release and check if we should notify proxy of availability
+                    memoryTracker.release(allocJavaMem)
+                    // Wake up every waiting  thread in queue
+                    memorySignal.emit(Unit)
+                    // Ping proxy if queue is empty and space is available
+                    if (waitingThreadsCount.get() == 0 && memoryTracker.getRemainingJavaRoom() > 0) {
+                        proxyNotifier.sendStatusUpdate(isAvailable = true, reason = "MEM_AVAILABLE")
+                    }
+                }
                 if (permanentFile.exists()) permanentFile.delete()
             }
         } catch (oom: OutOfMemoryError) {
@@ -140,41 +173,41 @@ class testServer(private val context: Context, private val userDao: UserDao, por
         }
     }
 
-    private fun handleConcurrencyChange(session: IHTTPSession): Response {
-        try {
-            val maxThreadsParam = session.parameters["maxThreads"]?.firstOrNull()
-            val newLimit = maxThreadsParam?.toIntOrNull() ?: -1
+//    private fun handleConcurrencyChange(session: IHTTPSession): Response {
+//        try {
+//            val maxThreadsParam = session.parameters["maxThreads"]?.firstOrNull()
+//            val newLimit = maxThreadsParam?.toIntOrNull() ?: -1
+//
+//            if (newLimit <= 0) {
+//                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Invalid limit"))
+//            }
+//
+//            // --- Resource Saturation Guard ---
+//            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+//            val memoryInfo = ActivityManager.MemoryInfo()
+//            activityManager.getMemoryInfo(memoryInfo)
+//
+//            if (memoryInfo.lowMemory) {
+//                Log.w("TestServer", "Rejecting concurrency increase: Memory saturation detected.")
+//                return addCorsHeaders(newFixedLengthResponse(Response.Status.TOO_MANY_REQUESTS, "text/plain", "Saturation Reached: System memory low."))
+//            }
+//
+//            synchronized(this) {
+//                currentMaxThreads = newLimit
+//                maxConcurrentThreads = Semaphore(newLimit, true)
+//            }
+//
+//            Log.i("TestServer", "Concurrency updated to: $newLimit")
+//            return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max threads set to $newLimit"))
+//        } catch (e: Exception) {
+//            return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}"))
+//        }
+//    }
 
-            if (newLimit <= 0) {
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Invalid limit"))
-            }
-
-            // --- Resource Saturation Guard ---
-            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            val memoryInfo = ActivityManager.MemoryInfo()
-            activityManager.getMemoryInfo(memoryInfo)
-
-            if (memoryInfo.lowMemory) {
-                Log.w("TestServer", "Rejecting concurrency increase: Memory saturation detected.")
-                return addCorsHeaders(newFixedLengthResponse(Response.Status.TOO_MANY_REQUESTS, "text/plain", "Saturation Reached: System memory low."))
-            }
-
-            synchronized(this) {
-                currentMaxThreads = newLimit
-                maxConcurrentThreads = Semaphore(newLimit, true)
-            }
-
-            Log.i("TestServer", "Concurrency updated to: $newLimit")
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max threads set to $newLimit"))
-        } catch (e: Exception) {
-            return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}"))
-        }
-    }
-
-    private fun handleGetMaxThreads(): Response {
-        Log.i("TestServer", "Returning current max threads: $currentMaxThreads")
-        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", currentMaxThreads.toString()))
-    }
+//    private fun handleGetMaxThreads(): Response {
+//        Log.i("TestServer", "Returning current max threads: $currentMaxThreads")
+//        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", currentMaxThreads.toString()))
+//    }
 
     private fun handleFileDownload(session: IHTTPSession): Response {
         val params = session.parameters
@@ -258,9 +291,9 @@ class testServer(private val context: Context, private val userDao: UserDao, por
         val runtime = Runtime.getRuntime()
 
         // 1. JVM Heap Stats (Standard)
-        val maxHeapMb = runtime.maxMemory() // (1024 * 1024)
-        val totalHeapMb = runtime.totalMemory() // (1024 * 1024)
-        val freeInTotalMb = runtime.freeMemory() // (1024 * 1024)
+        val maxHeapMb = runtime.maxMemory() / (1024.0 * 1024.0)
+        val totalHeapMb = runtime.totalMemory() / (1024.0 * 1024.0)
+        val freeInTotalMb = runtime.freeMemory() / (1024.0 * 1024.0)
         val actualUsedHeapMb = totalHeapMb - freeInTotalMb
 
         // 2. Process-wide Native Stats (Critical for TFLite/Bitmaps)
@@ -293,9 +326,10 @@ class testServer(private val context: Context, private val userDao: UserDao, por
 
         val memoryData = mapOf(
             "jvm_heap" to mapOf(
-                "free_mb" to freeInTotalMb,
-                "total_mb" to totalHeapMb,
-                "max_limit_mb" to maxHeapMb
+                "free_mb" to "%.2f".format(freeInTotalMb),
+                "total_mb" to "%.2f".format(totalHeapMb),
+                "max_limit_mb" to "%.2f".format(maxHeapMb),
+                "actual_used_mb" to "%.2f".format(actualUsedHeapMb)
             ),
             "pss_mem" to mapOf(
                 "native_pss_mb" to nativePssMb,

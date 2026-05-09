@@ -11,7 +11,7 @@ SET_CONCURRENCY_URL = f"http://{SERVER_IP}:8080/set-concurrency"
 
 # Stress test settings
 START_THREADS = 1
-END_THREADS = 1
+END_THREADS = 5
 STEP = 1
 REQUESTS_PER_STEP = 20  # Total requests to send for each concurrency level
 

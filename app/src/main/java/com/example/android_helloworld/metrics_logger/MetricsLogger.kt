@@ -14,7 +14,7 @@ class MetricsLogger(context: Context) {
     fun getDetailedTimestamp(): String =
         SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
 
-    fun logToCsv(clientId: String, received: String, start: String, end: String, sent: String) {
+    fun logToCsv(clientId: String, received: String, start: String, end: String, sent: String, waitTimeMs: String) {
         synchronized(csvLock) {
             try {
                 val fileExists = csvOutputFile.exists()
@@ -22,7 +22,7 @@ class MetricsLogger(context: Context) {
                     if (!fileExists) {
                         writer.append("ID,Request_Received,Recognition_Start,Recognition_End,Response_Sent\n")
                     }
-                    writer.append("$clientId,$received,$start,$end,$sent\n")
+                    writer.append("$clientId,$received,$start,$end,$sent,$waitTimeMs\n")
                 }
             } catch (e: Exception) {
                 Log.e("MetricsLogger", "CSV Write Error: ${e.message}")
