@@ -4,11 +4,13 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.annotation.RequiresApi
 import androidx.room.Room
 import com.example.android_helloworld.db.AppDatabase
 import com.example.android_helloworld.db.User
@@ -40,13 +42,19 @@ class MainActivity : ComponentActivity() {
 
     private var serviceAnnouncer: ServiceAnnouncer? = null // edge service announcer
 
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setupCrashHandler()
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Start server as a foreground service instead
-        startForegroundService(Intent(this, ServerService::class.java))
+        requestPermissions(
+            arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+            0
+        )
+
+        // Start server
+        startService(Intent(this, ServerService::class.java))
 
         // Start watchdog
         startService(Intent(this, WatchdogService::class.java))

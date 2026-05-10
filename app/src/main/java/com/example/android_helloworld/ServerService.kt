@@ -3,8 +3,8 @@ package com.example.android_helloworld
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
-import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
@@ -114,15 +114,24 @@ class ServerService : Service() {
                 NotificationManager.IMPORTANCE_LOW
             )
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            Log.i("ServerService", "Notification channel created.")
         }
     }
 
     private fun buildNotification(): Notification {
+        val launchIntent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, launchIntent, PendingIntent.FLAG_IMMUTABLE
+        )
+
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, "server_channel")
                 .setContentTitle("Server Running")
                 .setContentText("Listening on port 8080")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentIntent(pendingIntent)
+                .setOngoing(true)        // can't be dismissed by swiping
+                .setOnlyAlertOnce(true)  // no sound/vibration on update
                 .build()
         } else {
             @Suppress("DEPRECATION")
@@ -130,6 +139,9 @@ class ServerService : Service() {
                 .setContentTitle("Server Running")
                 .setContentText("Listening on port 8080")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentIntent(pendingIntent)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
                 .build()
         }
     }
