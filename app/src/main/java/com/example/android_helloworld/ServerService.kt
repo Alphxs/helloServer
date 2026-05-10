@@ -13,6 +13,7 @@ import androidx.room.Room
 import com.example.android_helloworld.db.AppDatabase
 import com.example.android_helloworld.db.User
 import com.example.android_helloworld.helpers.getIpAddress
+import com.example.android_helloworld.service_announcer.ServiceAnnouncer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
