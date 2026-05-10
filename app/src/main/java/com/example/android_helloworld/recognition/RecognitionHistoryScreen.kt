@@ -18,6 +18,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.android_helloworld.db.RecognitionResult
 import com.example.android_helloworld.helpers.BitmapLoader
+import androidx.compose.material.icons.filled.Warning
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -29,6 +30,15 @@ fun RecognitionHistoryScreen(viewModel: RecognitionViewModel) {
             TopAppBar(
                 title = { Text("Recognition History") },
                 actions = {
+                    // Temporary test button for simulating OOM kill
+                    IconButton(onClick = {
+                        android.os.Process.killProcess(android.os.Process.myPid())
+                    }) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = "Simulate Kill"
+                        )
+                    }
                     // Show the clear button only if there's something to clear
                     if (results.isNotEmpty()) {
                         IconButton(onClick = { viewModel.clearHistory() }) {
