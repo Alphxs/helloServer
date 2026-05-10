@@ -76,7 +76,7 @@ class ServerService : Service() {
                 }
 
                 server = testServer(applicationContext, userDao, 8080)
-                server?.start()
+                server?.start(0, false)
                 isRunning = true
                 Log.i("ServerService", "Server started successfully on port 8080.")
 
