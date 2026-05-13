@@ -8,9 +8,11 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 
-class ProxyNotifier(private val context: Context, private val proxyUrl: String) : ComponentCallbacks2 {
+class ProxyNotifier(private val context: Context, initialProxyUrl: String) : ComponentCallbacks2 {
     private val client = OkHttpClient()
 
+    @Volatile
+    private var proxyUrl: String = initialProxyUrl
     private val JAVA_HEAP_THRESHOLD_MB = 192.0
 
     /**
@@ -76,6 +78,11 @@ class ProxyNotifier(private val context: Context, private val proxyUrl: String) 
                 response.close()
             }
         })
+    }
+
+    fun updateProxyIp(ip: String, port: Int = 8080) {
+        this.proxyUrl = "http://$ip:$port/status"
+        Log.i("ProxyNotifier", "Proxy IP updated to: $proxyUrl")
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {}

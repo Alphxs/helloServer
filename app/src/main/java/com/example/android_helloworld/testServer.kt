@@ -12,12 +12,10 @@ import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.*
 import java.io.File
 import java.io.IOException
-import java.util.concurrent.Semaphore
 import com.example.android_helloworld.recognition.ImageRecognizer
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.Semaphore
 
 // Data class for sending predictions back as JSON
 data class Prediction(val label: String, val score: Float)
@@ -27,17 +25,29 @@ class testServer(private val context: Context, private val userDao: UserDao, por
     @Volatile private var lastBatteryFetchTime: Long = 0
     private val batteryCacheDurationMs = 1000 // Cache for 1 second
     private val gson = Gson()
-    private val memoryLock = Mutex()
     private val logger = MetricsLogger(context)
 
+    private val memoryLock = Mutex()
+
     private val memoryTracker = MemoryTracker(context)
-    private val proxyNotifier = ProxyNotifier(context, "http://YOUR_PROXY_IP:PORT/status")
+    private val proxyNotifier = ProxyNotifier(context, "http://192.168.137.28:8080/status")
 
-    // Broadcast signal: Wakes up ALL waiting coroutines
-    private val memorySignal = MutableSharedFlow<Unit>(replay = 0)
+    private lateinit var memorySemaphore: Semaphore
+    private var totalMemoryPermits: Int = 0
 
-    // Tracks how many requests are currently in the "Waiting Room"
-    private val waitingThreadsCount = java.util.concurrent.atomic.AtomicInteger(0)
+    init {
+        // Initialize semaphore based on available bytes
+        val initialMb = memoryTracker.getInitialPlaygroundMem()
+        val permits = initialMb.coerceAtLeast(1)
+
+        totalMemoryPermits = permits
+
+        // true = fair queuing (First-Come-First-Served)
+        memorySemaphore = Semaphore(permits, true)
+
+        Log.i("TestServer", "Memory Semaphore initialized with $permits bytes permits")
+    }
+
 
     /**
      * The main entry point for all HTTP requests.
@@ -72,11 +82,10 @@ class testServer(private val context: Context, private val userDao: UserDao, por
 
         return when {
             method == Method.POST && uri == "/recognize" -> handleRecognition(session)
-//            method == Method.POST && uri == "/set-concurrency" -> handleConcurrencyChange(session)
-//            method == Method.GET && uri == "/get-max-threads" -> handleGetMaxThreads()
             method == Method.GET && uri == "/battery" || method == Method.GET && uri == "/status" -> handleBatteryRequest()
             method == Method.GET && uri == "/download" -> handleFileDownload(session)
             method == Method.GET && uri == "/memory" -> handleMemoryRequest()
+            method == Method.POST && uri == "/proxy-handshake" -> handleProxyHandshake(session)
             else -> {
                 Log.w("TestServer", "Unhandled request for URI: $uri")
                 addCorsHeaders(newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Error: Not Found"))
@@ -107,31 +116,18 @@ class testServer(private val context: Context, private val userDao: UserDao, por
             val (allocJavaMem, allocNativeMem) = memoryTracker.calculateMemory(permanentFile.absolutePath)
 
             var waitStartTime = System.currentTimeMillis()
-            var isAdmitted = false
 
-            // Notify Proxy immediately if we are already saturated before waiting
-            if (!memoryTracker.canFit(allocJavaMem, allocNativeMem)) {
-                proxyNotifier.sendStatusUpdate(isAvailable = false, reason = "MEM_SATURATED_QUEUING")
+            memoryLock.withLock {
+                // Notify Proxy immediately if we are already saturated before waiting
+                if (memorySemaphore.availablePermits() < allocJavaMem) {
+                    proxyNotifier.sendStatusUpdate(isAvailable = false, reason = "MEM_SATURATED_QUEUING")
+                    Log.i("TestServer", "Queueing detected. Notified Proxy: BUSY")
+                }
             }
 
-            // Wait for memory to be available
-            waitingThreadsCount.incrementAndGet()
-            try {
-                while (!isAdmitted) {
-                    memoryLock.withLock {
-                        if (memoryTracker.tryReserve(allocJavaMem, allocNativeMem)) {
-                            isAdmitted = true
-                        }
-                    }
-
-                    if (!isAdmitted) {
-                        // SUSPEND here. When memorySignal.emit() is called later,
-                        // ALL waiting threads wake up and loop back to tryReserve.
-                        memorySignal.first()
-                    }
-                }
-            } finally {
-                waitingThreadsCount.decrementAndGet()
+            // Acquire permits (subtract to semaphore)
+            withContext(Dispatchers.IO) {
+                memorySemaphore.acquire(allocJavaMem.toInt())
             }
 
             val waitDurationMs = System.currentTimeMillis() - waitStartTime
@@ -146,15 +142,13 @@ class testServer(private val context: Context, private val userDao: UserDao, por
                 logger.logToCsv(clientId, receivedTime, recognitionStartTime, recognitionEndTime, logger.getDetailedTimestamp(), waitDurationMs.toString())
                 addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
             } finally {
-                memoryLock.withLock {
-                    // Release and check if we should notify proxy of availability
-                    memoryTracker.release(allocJavaMem)
-                    // Wake up every waiting  thread in queue
-                    memorySignal.emit(Unit)
-                    // Ping proxy if queue is empty and space is available
-                    if (waitingThreadsCount.get() == 0 && memoryTracker.getRemainingJavaRoom() > 0) {
-                        proxyNotifier.sendStatusUpdate(isAvailable = true, reason = "MEM_AVAILABLE")
-                    }
+                // Release permits
+                memorySemaphore.release(allocJavaMem.toInt())
+
+                // Notify proxy that edge is available if it has no active queue
+                if (!memorySemaphore.hasQueuedThreads() && memorySemaphore.availablePermits() >= totalMemoryPermits) {
+                    proxyNotifier.sendStatusUpdate(true, "MEM_AVAILABLE")
+                    Log.i("TestServer", "Memory available status sent to Proxy!")
                 }
                 if (permanentFile.exists()) permanentFile.delete()
             }
@@ -172,42 +166,6 @@ class testServer(private val context: Context, private val userDao: UserDao, por
             permanentFile?.let { if (it.exists()) it.delete() }
         }
     }
-
-//    private fun handleConcurrencyChange(session: IHTTPSession): Response {
-//        try {
-//            val maxThreadsParam = session.parameters["maxThreads"]?.firstOrNull()
-//            val newLimit = maxThreadsParam?.toIntOrNull() ?: -1
-//
-//            if (newLimit <= 0) {
-//                return addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Invalid limit"))
-//            }
-//
-//            // --- Resource Saturation Guard ---
-//            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-//            val memoryInfo = ActivityManager.MemoryInfo()
-//            activityManager.getMemoryInfo(memoryInfo)
-//
-//            if (memoryInfo.lowMemory) {
-//                Log.w("TestServer", "Rejecting concurrency increase: Memory saturation detected.")
-//                return addCorsHeaders(newFixedLengthResponse(Response.Status.TOO_MANY_REQUESTS, "text/plain", "Saturation Reached: System memory low."))
-//            }
-//
-//            synchronized(this) {
-//                currentMaxThreads = newLimit
-//                maxConcurrentThreads = Semaphore(newLimit, true)
-//            }
-//
-//            Log.i("TestServer", "Concurrency updated to: $newLimit")
-//            return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Max threads set to $newLimit"))
-//        } catch (e: Exception) {
-//            return addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}"))
-//        }
-//    }
-
-//    private fun handleGetMaxThreads(): Response {
-//        Log.i("TestServer", "Returning current max threads: $currentMaxThreads")
-//        return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", currentMaxThreads.toString()))
-//    }
 
     private fun handleFileDownload(session: IHTTPSession): Response {
         val params = session.parameters
@@ -269,10 +227,14 @@ class testServer(private val context: Context, private val userDao: UserDao, por
             "Not Supported"
         }
 
+        val androidVersion = getAndroidVersion()
+
         val batteryData = mapOf(
             "level" to "%.1f%%".format(batteryPct),
-            "status" to chargingStatus,
-            "remaining_mah" to mahString
+            "status" to "AVAILABLE",
+            "chargingStatus" to chargingStatus,
+            "remaining_mah" to mahString,
+            "android_version" to androidVersion
         )
         val jsonResponse = gson.toJson(batteryData)
 
@@ -280,6 +242,27 @@ class testServer(private val context: Context, private val userDao: UserDao, por
         cachedBatteryJson = jsonResponse
         lastBatteryFetchTime = currentTime
         return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", cachedBatteryJson))
+    }
+
+    private fun handleProxyHandshake(session: IHTTPSession): Response {
+        return try {
+            val files = mutableMapOf<String, String>()
+            session.parseBody(files)
+
+            // The Proxy sends its own IP and Port in the post body or parameters
+            val proxyIp = session.parameters["ip"]?.firstOrNull()
+            val proxyPort = session.parameters["port"]?.firstOrNull()?.toIntOrNull() ?: 8080
+
+            if (proxyIp != null) {
+                proxyNotifier.updateProxyIp(proxyIp, proxyPort)
+                Log.i("TestServer", "Handshake successful! Proxy introduces itself at: $proxyIp:$proxyPort")
+                addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "text/plain", "Handshake Accepted"))
+            } else {
+                addCorsHeaders(newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "Missing IP"))
+            }
+        } catch (e: Exception) {
+            addCorsHeaders(newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", e.message))
+        }
     }
 
     // Not used in the actual implementation, just for testing purposes
@@ -365,4 +348,9 @@ class testServer(private val context: Context, private val userDao: UserDao, por
         response.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         return response
     }
+
+    private fun getAndroidVersion(): Int {
+        return android.os.Build.VERSION.SDK_INT
+    }
+
 }
