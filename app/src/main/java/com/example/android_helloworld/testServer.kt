@@ -14,15 +14,28 @@ import java.io.File
 import java.io.IOException
 import com.example.android_helloworld.recognition.ImageRecognizer
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.Semaphore
 
 // Data class for sending predictions back as JSON
 data class Prediction(val label: String, val score: Float)
 
+enum class RoutingAlgorithm {
+    RANDOM,
+    RANDOM_CPT,
+    RTTMS,
+    RESAT_V2
+}
+
 class testServer(private val context: Context, private val userDao: UserDao, port: Int) : NanoHTTPD(port) {
     @Volatile private var cachedBatteryJson: String? = null
     @Volatile private var lastBatteryFetchTime: Long = 0
+
+    @Volatile var currentAlgorithm = RoutingAlgorithm.RTTMS
+
+    fun setAlgorithm(algo: RoutingAlgorithm) {
+        currentAlgorithm = algo
+        Log.i("TestServer", "Routing Algorithm changed to: $algo")
+    }
     private val batteryCacheDurationMs = 1000 // Cache for 1 second
     private val gson = Gson()
     private val logger = MetricsLogger(context)
@@ -35,7 +48,12 @@ class testServer(private val context: Context, private val userDao: UserDao, por
     private lateinit var memorySemaphore: Semaphore
     private var totalMemoryPermits: Int = 0
 
+    //private val heapProfiler = HeapProfiler(context)
+
     init {
+        // Start tracking heap behavior every 100ms
+        //heapProfiler.startProfiling(50)
+
         // Initialize semaphore based on available bytes
         val initialMb = memoryTracker.getInitialPlaygroundMem()
         val permits = initialMb.coerceAtLeast(1)
@@ -112,23 +130,24 @@ class testServer(private val context: Context, private val userDao: UserDao, por
             permanentFile = File(permanentImageDir, "img_${taskId}.jpg")
             tempFile.copyTo(permanentFile, overwrite = true)
 
+            if (currentAlgorithm == RoutingAlgorithm.RANDOM || currentAlgorithm == RoutingAlgorithm.RESAT_V2) {
+                Log.i("ALGO", "Executing in RANDOM/RESAT_V2 mode (No Crash Prevention)")
+                val startTime = logger.getDetailedTimestamp()
+                val result = ImageRecognizer(context, userDao, proxyNotifier).use { it.processImage(permanentFile!!) }
+                val endTime = logger.getDetailedTimestamp()
+
+                // waitTime is 0 because there is no queue in Random mode
+                logger.logToCsv(clientId, receivedTime, startTime, endTime, logger.getDetailedTimestamp(), "0")
+                return addCorsHeaders(newFixedLengthResponse(Response.Status.OK, "application/json", result))
+            }
+
             // Compute Allocated Memory for Java heap and Native mem
             val (allocJavaMem, allocNativeMem) = memoryTracker.calculateMemory(permanentFile.absolutePath)
 
             var waitStartTime = System.currentTimeMillis()
 
-            memoryLock.withLock {
-                // Notify Proxy immediately if we are already saturated before waiting
-                if (memorySemaphore.availablePermits() < allocJavaMem) {
-                    proxyNotifier.sendStatusUpdate(isAvailable = false, reason = "MEM_SATURATED_QUEUING")
-                    Log.i("TestServer", "Queueing detected. Notified Proxy: BUSY")
-                }
-            }
-
-            // Acquire permits (subtract to semaphore)
-            withContext(Dispatchers.IO) {
-                memorySemaphore.acquire(allocJavaMem.toInt())
-            }
+            // Acquire permits.
+            memorySemaphore.acquire(allocJavaMem.toInt())
 
             val waitDurationMs = System.currentTimeMillis() - waitStartTime
 
@@ -145,11 +164,6 @@ class testServer(private val context: Context, private val userDao: UserDao, por
                 // Release permits
                 memorySemaphore.release(allocJavaMem.toInt())
 
-                // Notify proxy that edge is available if it has no active queue
-                if (!memorySemaphore.hasQueuedThreads() && memorySemaphore.availablePermits() >= totalMemoryPermits) {
-                    proxyNotifier.sendStatusUpdate(true, "MEM_AVAILABLE")
-                    Log.i("TestServer", "Memory available status sent to Proxy!")
-                }
                 if (permanentFile.exists()) permanentFile.delete()
             }
         } catch (oom: OutOfMemoryError) {
@@ -229,12 +243,15 @@ class testServer(private val context: Context, private val userDao: UserDao, por
 
         val androidVersion = getAndroidVersion()
 
+        val freeMem = memoryTracker.getInitialPlaygroundMem()
+
         val batteryData = mapOf(
             "level" to "%.1f%%".format(batteryPct),
             "status" to "AVAILABLE",
             "chargingStatus" to chargingStatus,
             "remaining_mah" to mahString,
-            "android_version" to androidVersion
+            "android_version" to androidVersion,
+            "freeMem" to freeMem
         )
         val jsonResponse = gson.toJson(batteryData)
 

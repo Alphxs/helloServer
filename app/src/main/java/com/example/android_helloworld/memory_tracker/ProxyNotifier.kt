@@ -1,89 +1,58 @@
 package com.example.android_helloworld
 
-import android.content.ComponentCallbacks2
 import android.content.Context
-import android.content.res.Configuration
 import android.util.Log
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.concurrent.TimeUnit
 
-class ProxyNotifier(private val context: Context, initialProxyUrl: String) : ComponentCallbacks2 {
-    private val client = OkHttpClient()
+class ProxyNotifier(private val context: Context, initialProxyUrl: String) {
 
-    @Volatile
-    private var proxyUrl: String = initialProxyUrl
-    private val JAVA_HEAP_THRESHOLD_MB = 192.0
+    // 1. Create a ConnectionPool to keep the socket open
+    private val connectionPool = ConnectionPool(5, 5, TimeUnit.MINUTES)
 
-    /**
-     * This is called by the server whenever a memory-heavy event starts.
-     */
-    fun checkAndNotifyHeapThreshold() {
-        val runtime = Runtime.getRuntime()
-        val totalHeapMb = runtime.totalMemory() / (1024.0 * 1024.0)
+    private val client = OkHttpClient.Builder()
+        .connectionPool(connectionPool)
+        .connectTimeout(0, TimeUnit.SECONDS) // No timeout for connecting
+        .readTimeout(0, TimeUnit.SECONDS)
+        .writeTimeout(0, TimeUnit.SECONDS)
+        .build()
 
-        if (totalHeapMb > JAVA_HEAP_THRESHOLD_MB) {
-            Log.e("ProxyNotifier", "THRESHOLD ALERT: Total Heap (%.2f MB) exceeded limit!".format(totalHeapMb))
-            sendLowMemoryAlert("JVM_TOTAL_MEMORY_EXCEEDED_THRESHOLD")
-        }
-    }
+    @Volatile private var proxyUrl: String = initialProxyUrl
 
-    override fun onTrimMemory(level: Int) {
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
-            sendLowMemoryAlert("TRIM_MEMORY_RUNNING_LOW")
-        }
-    }
-
-    override fun onLowMemory() {
-        sendLowMemoryAlert("CRITICAL_LOW_MEMORY")
-    }
-
-    fun sendLowMemoryAlert(reason: String) {
-        val json = """{"status": "low_memory", "reason": "$reason", "edge_id": "edge_1"}"""
-        val body = json.toRequestBody("application/json".toMediaType())
-        val request = Request.Builder().url(proxyUrl).post(body).build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: java.io.IOException) {
-                Log.e("ProxyNotifier", "Failed to notify proxy: ${e.message}")
-            }
-            override fun onResponse(call: Call, response: Response) {
-                response.close()
-            }
-        })
+    fun updateProxyIp(ip: String, port: Int) {
+        this.proxyUrl = "http://$ip:$port/status"
+        Log.i("ProxyNotifier", "Proxy IP established: $proxyUrl")
+        // Send an initial ping to "warm up" the connection
+        sendStatusUpdate(true, "INITIAL_HANDSHAKE")
     }
 
     fun sendStatusUpdate(isAvailable: Boolean, reason: String) {
-        val status = if (isAvailable) "AVAILABLE" else "BUSY"
-        val json = """
-        {
-            "edge_id": "edge_1",
-            "status": "$status",
-            "reason": "$reason",
-            "timestamp": "${System.currentTimeMillis()}"
-        }
-    """.trimIndent()
+        if (proxyUrl.contains("YOUR_PROXY_IP")) return
 
+        val status = if (isAvailable) "AVAILABLE" else "BUSY"
+        val json = """{"edge_id": "edge_1", "status": "$status", "reason": "$reason"}"""
         val body = json.toRequestBody("application/json".toMediaType())
+
         val request = Request.Builder()
-            .url(proxyUrl) // Ensure this points to the proxy's status endpoint
+            .url(proxyUrl)
             .post(body)
+            // 2. Explicitly ask the Proxy to keep the connection open
+            .header("Connection", "Keep-Alive")
             .build()
 
+        // We use execute() in a background thread or enqueue to send immediately
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: java.io.IOException) {
-                Log.e("ProxyNotifier", "Failed to send status update: ${e.message}")
+                Log.i("ProxyNotifier", "Failed to send status: ${e.message}")
             }
             override fun onResponse(call: Call, response: Response) {
+                // 3. IMPORTANT: You MUST close or read the body to return
+                // the connection to the pool so it stays open!
                 response.close()
+                Log.i("ProxyNotifier", "Status sent successfully")
             }
         })
     }
-
-    fun updateProxyIp(ip: String, port: Int = 8080) {
-        this.proxyUrl = "http://$ip:$port/status"
-        Log.i("ProxyNotifier", "Proxy IP updated to: $proxyUrl")
-    }
-
-    override fun onConfigurationChanged(newConfig: Configuration) {}
 }

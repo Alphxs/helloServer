@@ -2,6 +2,7 @@ package com.example.android_helloworld.recognition
 
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.os.Debug
 import android.util.Log
 import com.example.android_helloworld.ProxyNotifier
 import com.example.android_helloworld.Prediction
@@ -13,19 +14,23 @@ import org.tensorflow.lite.task.vision.detector.Detection
 import org.tensorflow.lite.task.vision.detector.ObjectDetector
 import java.io.Closeable
 import java.io.File
+import java.io.FileWriter
 import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.*
 
-/**
- * Encapsulates the logic for image recognition. It loads the model and provides
- * a method to perform detection on an image file. This class is NOT thread-safe
- * on its own and should be used by a queuing mechanism like RecognitionTaskQueue.
- */
-class ImageRecognizer(context: Context, private val userDao: UserDao, private val proxyNotifier: ProxyNotifier): Closeable {
+class ImageRecognizer(
+    private val context: Context,
+    private val userDao: UserDao,
+    private val proxyNotifier: ProxyNotifier
+): Closeable {
 
     private val gson = Gson()
     private val objectDetector: ObjectDetector
+    private val csvFile = File(context.getExternalFilesDir(null), "heap_profile_log.csv")
 
     init {
+        ensureCsvHeader()
         Log.i("ImageRecognizer", "Initializing ObjectDetector...")
         val options = ObjectDetector.ObjectDetectorOptions.builder()
             .setMaxResults(5)
@@ -33,37 +38,34 @@ class ImageRecognizer(context: Context, private val userDao: UserDao, private va
             .build()
         objectDetector = ObjectDetector.createFromFileAndOptions(
             context,
-            "model_detection.tflite", // Ensure this model is in app/src/main/assets
+            "model_detection.tflite",
             options
         )
         Log.i("ImageRecognizer", "ObjectDetector initialized successfully.")
-
     }
+
     override fun close() {
         objectDetector?.close()
         Log.i("ImageRecognizer", "ObjectDetector has been closed.")
     }
 
-    /**
-     * Processes a single image file, runs detection, saves the result, and returns a JSON string.
-     * This method is NOT thread-safe and should only be called from a single thread at a time.
-     */
-    suspend fun processImage(
-        permanentImageFile: File,
-    ): String {
+    suspend fun processImage(permanentImageFile: File): String {
+        // Milestone 1: After decoding the file
         val bitmap = BitmapFactory.decodeFile(permanentImageFile.absolutePath)
-        proxyNotifier.checkAndNotifyHeapThreshold() // Check threshold after bitmap is allocated
+        recordMilestone("AFTER_DECODE")
 
         if (bitmap == null) {
             throw IOException("Failed to decode the image file.")
         }
 
         try {
+            // Milestone 2: After creating the TensorImage
             val tensorImage = TensorImage.fromBitmap(bitmap)
-            proxyNotifier.checkAndNotifyHeapThreshold() // Check threshold after TensorImage is created
+            recordMilestone("AFTER_TENSOR")
 
+            // Milestone 3: After Native Detection (The heaviest part)
             val results: List<Detection> = objectDetector.detect(tensorImage)
-            proxyNotifier.checkAndNotifyHeapThreshold() // Check threshold after detection
+            recordMilestone("AFTER_DETECT")
 
             val predictions = results.flatMap { detection ->
                 detection.categories.map { category ->
@@ -72,7 +74,6 @@ class ImageRecognizer(context: Context, private val userDao: UserDao, private va
             }
 
             val jsonResponse = gson.toJson(predictions)
-            Log.i("ImageRecognizer", "Detection complete. Found: ${predictions.joinToString { it.label }}")
 
             val recognizedObjectsStr = predictions.joinToString(", ") { it.label }
             if (recognizedObjectsStr.isNotEmpty()) {
@@ -88,6 +89,54 @@ class ImageRecognizer(context: Context, private val userDao: UserDao, private va
 
         } finally {
             bitmap.recycle()
+        }
+    }
+
+    /**
+     * Captures a snapshot of the memory and writes it to the CSV.
+     * Uses Dalvik PSS to match the Android Studio Profiler "Java" bar.
+     */
+    private fun recordMilestone(event: String) {
+        try {
+            val runtime = Runtime.getRuntime()
+            val maxMb = runtime.maxMemory() / (1024.0 * 1024.0)
+            val jvmUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024.0 * 1024.0)
+
+            // Capture Physical Java Memory (includes ART overhead)
+            val memInfo = Debug.MemoryInfo()
+            Debug.getMemoryInfo(memInfo)
+
+            val profilerJavaMb = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                // 'summary.java' is exactly what the Profiler's Java bar shows
+                (memInfo.getMemoryStat("summary.java")?.toDouble() ?: memInfo.dalvikPss.toDouble()) / 1024.0
+            } else {
+                memInfo.dalvikPss.toDouble() / 1024.0
+            }
+
+            val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
+            val line = "$timestamp,${"%.2f".format(maxMb)},${"%.2f".format(jvmUsedMb)},${"%.2f".format(profilerJavaMb)},$event"
+
+            writeToProfileCsv(line)
+        } catch (e: Exception) {
+            Log.e("HeapProfiler", "Error recording milestone: ${e.message}")
+        }
+    }
+
+    private fun ensureCsvHeader() {
+        if (!csvFile.exists()) {
+            writeToProfileCsv("Timestamp,Max_Limit_MB,JVM_Used_MB,Profiler_Java_MB,Event")
+        }
+    }
+
+    private fun writeToProfileCsv(line: String) {
+        try {
+            // We open, flush, and close immediately to ensure data persists through a crash
+            val writer = FileWriter(csvFile, true)
+            writer.append("$line\n")
+            writer.flush()
+            writer.close()
+        } catch (e: Exception) {
+            Log.e("HeapProfiler", "CSV Write Error: ${e.message}")
         }
     }
 }

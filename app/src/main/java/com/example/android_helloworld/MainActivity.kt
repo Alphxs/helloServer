@@ -5,6 +5,9 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.room.Room
 import com.example.android_helloworld.db.AppDatabase
 import com.example.android_helloworld.db.User
@@ -21,7 +24,7 @@ import com.example.android_helloworld.service_announcer.ServiceAnnouncer
 
 class MainActivity : ComponentActivity() {
 
-    private var server: testServer? = null
+    private var server by mutableStateOf<testServer?>(null)
 
     // Lazily initialize the database instance.
     private val db by lazy {
@@ -56,7 +59,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             // The RecognitionHistoryScreen composable will now be the main UI.
             // It observes the ViewModel for data changes.
-            RecognitionHistoryScreen(viewModel = viewModel)
+            RecognitionHistoryScreen(viewModel = viewModel, server = server)
         }
     }
 
